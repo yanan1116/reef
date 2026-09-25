@@ -22,3 +22,6 @@ local
 # Example runtime state (reef serve work dirs; may be root-owned from container runs)
 examples/*/work
 examples/*/work-*
+
+# Experiment scripts, data and results of this fork (never part of the image)
+exp_scripts
