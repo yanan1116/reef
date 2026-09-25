@@ -8,7 +8,7 @@ from typing import Any
 import ray
 
 from reef.inference.process import retire_engines
-from reef.inference.sglang.config import SGLangConfig
+from reef.inference.sglang.config import HEALTH_CHECK_TIMEOUT_S, SGLangConfig
 from reef.inference.sglang.health import SGLangEngineHealthChecks
 from reef.inference.sglang.launch import SGLangCluster, engine_environment
 from reef.runtime.publication import WeightUpdateLock
@@ -216,7 +216,7 @@ class SGLangWorker:
             monitor.check_health()
         engines = [engine for server in self.servers.values() for engine in server.all_engines if engine is not None]
         if engines:
-            ray.get([engine.__ray_ready__.remote() for engine in engines], timeout=30)
+            ray.get([engine.__ray_ready__.remote() for engine in engines], timeout=HEALTH_CHECK_TIMEOUT_S)
 
     def shutdown(self):
         if self._closed:

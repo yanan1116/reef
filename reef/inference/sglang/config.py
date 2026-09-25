@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -10,6 +11,11 @@ from reef.runtime.executor import Executor
 
 #: Bound on one control RPC or engine launch; a weight update legitimately takes hours.
 CONTROL_TIMEOUT_S = 14_400
+
+#: Bound on one SGLang health probe. A colocated training step (offload, critic and actor
+#: steps, checkpoint save, LoRA publish) can hold the host well past 30 s, and a probe that
+#: times out makes the supervisor tear the stack down. REEF_SGLANG_HEALTH_TIMEOUT_S raises it.
+HEALTH_CHECK_TIMEOUT_S = float(os.environ.get("REEF_SGLANG_HEALTH_TIMEOUT_S") or 30)
 
 
 @dataclass(frozen=True)
