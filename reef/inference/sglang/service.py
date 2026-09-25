@@ -8,7 +8,7 @@ from typing import Any
 import ray
 
 from reef.inference.sglang.backend import SGLangInferenceBackend
-from reef.inference.sglang.config import CONTROL_TIMEOUT_S, SGLangConfig
+from reef.inference.sglang.config import CONTROL_TIMEOUT_S, HEALTH_CHECK_TIMEOUT_S, SGLangConfig
 from reef.inference.sglang.launch import engine_environment
 from reef.runtime.deployment import (
     ADAPTER_FILES_PROTOCOL,
@@ -100,7 +100,7 @@ class SGLangInferenceService(InferenceService):
         return self._inference
 
     def check_health(self) -> None:
-        self._running().rpc(0, "check_health", timeout=30)
+        self._running().rpc(0, "check_health", timeout=HEALTH_CHECK_TIMEOUT_S)
 
     def poll(self) -> None:
         self._probe.poll(self._running().workers[0], "check_health")

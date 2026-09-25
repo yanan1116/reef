@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from reef.inference.sglang.config import CONTROL_TIMEOUT_S, SGLangConfig
+from reef.inference.sglang.config import CONTROL_TIMEOUT_S, HEALTH_CHECK_TIMEOUT_S, SGLangConfig
 from reef.runtime.executor import Executor, ExecutorConfig
 
 
@@ -35,7 +35,7 @@ class SGLangControl:
         return self._serving.rpc(0, method, args=args, timeout=CONTROL_TIMEOUT_S)
 
     def check_health(self) -> None:
-        self._serving.check_health(timeout=30)
+        self._serving.check_health(timeout=HEALTH_CHECK_TIMEOUT_S)
 
     def inference_url(self) -> Any:
         return self._call("inference_url")
