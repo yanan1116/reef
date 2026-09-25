@@ -98,6 +98,17 @@ RUN pip uninstall -y slime && \
     pip install -e . --no-deps && \
     pip install reef-client --no-deps
 
+# `pip install -e . --no-deps` above skips Reef's own [project].dependencies,
+# so `import reef` fails on the first one the base image lacks (tomli_w).
+# Install them here, resolving their dependencies, but refuse a torch change:
+# the CUDA-matched stack must stay the base image's. numpy is re-pinned by the
+# next layer either way. Keep this list in sync with pyproject.toml.
+RUN torch_before="$(python -c 'import torch; print(torch.__version__)')" && \
+    pip install --no-cache-dir "aiohttp>=3.14" "alembic>=1.13,<2" huggingface_hub pyyaml \
+        "reef-client>=0.2.0" "reef-eval[harbor]>=0.1.1" "sqlalchemy>=2.0,<3" tomli-w && \
+    torch_after="$(python -c 'import torch; print(torch.__version__)')" && \
+    if [ "$torch_before" != "$torch_after" ]; then echo "torch changed: $torch_before -> $torch_after" >&2; exit 1; fi
+
 # An earlier layer's dependency resolution can leave numpy 2.x debris behind
 # after pip downgrades (dist-info says 1.26.4 while 2.x submodules such as
 # numpy/_core survive in the package dir), which breaks every compiled
