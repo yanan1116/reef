@@ -1,0 +1,67 @@
+#!/bin/bash
+# Start the Reef SAO training stack inside the reef image built from this checkout
+# (scripts/build_image_head.sh; tag reef:sao-<last commit touching Reef source>).
+#
+# Mounts (host -> container):
+#   ~/reef-sao/models    -> /root/models        base model weights
+#   $STATE_DIR           -> /var/lib/reef       checkpoints, artifacts, agent records
+#   ~/reef-sao/data      -> /root/data          data the stack reads
+#   exp_scripts/ (here)  -> /repro              our configs, driver and results
+#   $KEEP_DIR (optional) -> /var/lib/reef-kept  checkpoint copies kept outside Reef's tree
+#
+# NCCL_P2P_DISABLE=1 is mandatory on .24: peer-to-peer NCCL hangs this host (the
+# verl/FSDP launchers carry the same export). Both LoRA publication attempts on
+# 2026-09-23 stopped at the identical line -- "LoRA adapter loading from
+# distributed starts" -- with the training batch left undrained for 1153 s. The
+# distributed transport broadcasts the adapter over NCCL; the colocated transport
+# exists precisely to avoid "creating an NCCL peer on the same GPU". Same symptom
+# with full LoRA and with MLP-only LoRA, so the transport is implicated, not the
+# adapter surface.
+#
+# The container runs with --network host so the driver on the host can reach
+# Reef on 127.0.0.1:8900, and --ipc host --shm-size 32g as the training stack needs.
+set -euo pipefail
+NAME=${NAME:-reef-sao-stack}
+REPRO="$(cd "$(dirname "$0")/.." && pwd)"   # exp_scripts/
+REEF_ROOT="$(cd "$REPRO/.." && pwd)"          # the reef fork checkout
+# Default image: the one build_image_head.sh builds from this checkout's Reef source.
+SRC_COMMIT=$(git -C "$REEF_ROOT" -c safe.directory='*' log -1 --format=%h -- . ':(exclude)exp_scripts')
+IMAGE=${IMAGE:-reef:sao-$SRC_COMMIT}
+CFG=${CFG:-/repro/configs/serve-deepcoder-2507-b128-lr5x.yaml}
+# Separate state per experiment: a stack restores its scenario version chains and
+# checkpoints from here, so two base models must never share one.
+STATE_DIR=${STATE_DIR:-/home/yanan/reef-sao/state}
+mkdir -p "$STATE_DIR"
+# Optional: a directory OUTSIDE the managed checkpoint tree where copies of
+# checkpoints are kept. Checkpoint files are root-owned and not world-readable,
+# so the copy has to run inside the container (see deepcoder/sidecar.py).
+KEEP_MOUNT=()
+if [ -n "${KEEP_DIR:-}" ]; then mkdir -p "$KEEP_DIR"; KEEP_MOUNT=(-v "$KEEP_DIR":/var/lib/reef-kept); fi
+
+# Optional OCI runtime. .16 needs DOCKER_RUNTIME=nvidia: its nvidia-container
+# config has no-cgroups = true, so with the default runc the GPU device nodes are
+# injected but not permitted and NVML fails ("Failed to initialize NVML: Unknown
+# Error"; Ray registers 0 GPUs). Unset keeps the exact .24 command line.
+RUNTIME_ARGS=()
+if [ -n "${DOCKER_RUNTIME:-}" ]; then RUNTIME_ARGS=(--runtime "$DOCKER_RUNTIME"); fi
+
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+docker run -d --name "$NAME" "${RUNTIME_ARGS[@]}" \
+  --gpus all --network host --ipc host --shm-size 32g \
+  -v /home/yanan/reef-sao/models:/root/models \
+  -v "$STATE_DIR":/var/lib/reef \
+  "${KEEP_MOUNT[@]}" \
+  -v /home/yanan/reef-sao/data:/root/data \
+  -v "$REPRO":/repro \
+  -e CUDA_VISIBLE_DEVICES=0,1 \
+  -e NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1} \
+  ${NVTE_DEBUG:+-e NVTE_DEBUG=$NVTE_DEBUG -e NVTE_DEBUG_LEVEL=${NVTE_DEBUG_LEVEL:-2}} \
+  -e PYTHONUNBUFFERED=1 \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e REEF_SGLANG_HEALTH_TIMEOUT_S=${REEF_SGLANG_HEALTH_TIMEOUT_S:-1200} \
+  -w /workspace/Reef \
+  "$IMAGE" \
+  bash -c "python3 -m reef serve -c $CFG 2>&1 | tee /var/lib/reef/reef.log"
+# (reef.log lands in $STATE_DIR on the host)
+
+echo "started $NAME from $IMAGE; log: docker logs -f $NAME  (also $STATE_DIR/reef.log)"

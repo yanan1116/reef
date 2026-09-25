@@ -1,0 +1,5 @@
+# Runtime inputs and outputs live next to the scripts but are not versioned.
+data/
+results/
+__pycache__/
+*.pyc
