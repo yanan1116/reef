@@ -1,0 +1,217 @@
+# SAO (arXiv:2607.07508) on DeepCoder with Qwen3-4B-Instruct-2507, two RTX 6000 Ada (48 GB).
+# lr5x variant: see note 8.
+#
+# Derived from recipes/sao/examples/imo_answerbench/serve.yaml. Everything in
+# the OBJECTIVE block is the upstream example's value, unchanged except the two
+# LoRA learning rates. What changed, and only what had to:
+#
+#  1. Model: Qwen2.5-1.5B-Instruct -> Qwen3-4B-Instruct-2507, the model every
+#     other DeepCoder training line here (PRPO, GRPO, self-SFT) used, so SAO is
+#     directly comparable to them. The upstream file warns that switching model
+#     families means replacing the architecture flags Reef cannot derive; the
+#     replacements are slime's own reference set for this exact checkpoint,
+#     scripts/models/qwen3-4B-Instruct-2507.sh (= qwen3-4B.sh with rotary base
+#     5e6): no QKV bias, QK layernorm, GQA. Size/topology flags are derived.
+#
+#     Why not Qwen3.5-4B, used for the IMO attempt: its full-attention layers
+#     have head_dim 256, and on this GPU (sm89) Transformer Engine reports
+#       "Disabling FlashAttention 2 ... head_dim_qk <= 256 (>192 requires
+#        sm80/90/100+). Found: head_dim_qk = 256, on sm8.9"
+#     with cuDNN FusedAttention also unavailable, leaving only the unfused
+#     backend, whose S x S score matrix OOMed the first actor step (36.32 GiB).
+#     2507 has head_dim 128 and gets FlashAttention 2.8.3 (checked with
+#     scripts/te_backend_probe_hd128.py), so the attention cost is linear.
+#
+#  2. LoRA instead of full-parameter training. Forced by memory: SAO colocates
+#     a second 4B model (the critic) on the actor GPU. The adapter settings and
+#     learning rates are Reef's official SAO LoRA values from
+#     recipes/sao/examples/ceobench/serve.yaml; rank 32 / alpha 32 on all linear
+#     layers also matches the PRPO and GRPO DeepCoder runs.
+#
+#  3. Batch size 128 (the paper, Section 4.1, and the recipe default): one
+#     rollout per prompt, 128 prompts per optimizer step, so one pass over the
+#     24,287-task train split is 190 steps.
+#  4. Durable checkpoint every 10 versions (the upstream example checkpoints
+#     every version). One checkpoint is the LoRA adapter plus the actor and
+#     critic Megatron states, ~16.6 GB measured, so every version would be
+#     ~3.1 TB per epoch against 1.4 TB free and the 'latest' retention policy
+#     would start deleting the early ones. Non-checkpoint versions still
+#     publish their weights to the engine live (committer.py:
+#     LiveWeightPublication), so serving stays one step behind training.
+#  5. Inference options for batch-128 streaming, from upstream serve-30b.yaml.
+#     The first formal run (2026-09-23 17:32) lost its engine at the step-2
+#     LoRA publication: "Scheduler watchdog timeout (self.watchdog_timeout=300)",
+#     with 128 requests running while the adapter was swapped. Upstream's README
+#     records the same failure ("publication pauses exceeding the SGLang
+#     scheduler's 300-second watchdog") and runs with max-running-requests 16
+#     and reef-side retries across an engine restart. Adopted verbatim, plus one
+#     deviation of ours: watchdog-timeout 1800, which still catches a real hang.
+#  6. Checkpoint storage cap. The backend writes a full bundle (adapter + actor
+#     + critic, ~16.3 GB) EVERY step regardless of checkpoint-every-n-versions;
+#     that setting only picks which versions are durable on the release chain.
+#     Reef's 'latest' retention protects only the newest and in-use bundles, so
+#     the cap bounds disk; sidecar.py copies what must be kept (every step's
+#     adapter, every 10th step's full bundle) out of the managed tree first.
+#  7. max-loaded-loras 3 instead of the default 1; see the comment at the flag.
+#  8. Second run (.16, 2026-09-24), trained from scratch: actor lr 5e-5 and critic
+#     lr 1e-4 (user's choice; the paper's 5:1 critic:actor ratio becomes 2:1).
+#     The first run (1e-5 / 5e-5, stopped at step 44) moved the adapter by a
+#     delta norm of only 0.51 after 30 actor updates, and its step-40 test score
+#     was within ~1 task of base noise. Resuming it was not attempted: the
+#     bundled Slime runtime does not implement checkpoint restoration.
+#     Durable versions every 20 (was 10); storage cap 400GB (user's choice,
+#     was 250GB), which keeps the newest ~24 bundles of ~16.7 GB each.
+
+schema-version: 2
+reef:
+  host: 127.0.0.1
+  port: 8900
+  token: reef-local
+  run-dir: /var/lib/reef/stack
+  ready-timeout: 3600
+
+inference:
+  model-path: /root/models/Qwen3-4B-Instruct-2507
+  num-gpus: "1"
+  tensor-parallel-size: "1"
+  timeout-s: 7200
+  retry-timeout-s: 7200                # upstream serve-30b: requests survive an engine restart
+  retry-max-s: 60
+  options:
+    router-port: "30000"
+    context-length: "32768"
+    # --- upstream serve-30b.yaml ---
+    disable-radix-cache: true          # "Required by Reef's SGLang inference backend (#432)"
+    incremental-streaming-output: true
+    mem-fraction-static: "0.7"
+    chunked-prefill-size: "4096"
+    max-running-requests: "16"
+    # --- ours ---
+    watchdog-timeout: "1800"
+  handler-factory: reef.inference.sglang.chat.SGLangInferenceHandler
+
+recipe:
+  implementation: recipes.sao.recipe:SAORecipe
+  config:
+    batch-size: 128                    # MUST equal training.config.global_batch_size and the driver's SAO_BATCH
+    max-staleness: 18
+    checkpoint-every-n-versions: 20
+
+training:
+  backend: slime
+  ready-timeout: 1800
+  timeout-s: 14400
+  config:
+    checkpoint_dir: /var/lib/reef/checkpoints
+    global_batch_size: 128
+  options:
+    megatron-to-hf-mode: "bridge"
+    hf-checkpoint: "${inference.model-path}"
+    load: "${training.config.checkpoint_dir}/megatron"
+    save: "${training.config.checkpoint_dir}/megatron"
+    save-interval: "100"
+    save-hf: "${training.config.checkpoint_dir}/hf/{rollout_id}"
+    num-rollout: "100000000"
+    rollout-batch-size: "${training.config.global_batch_size}"
+    global-batch-size: "${training.config.global_batch_size}"
+    micro-batch-size: "1"
+
+    # --- topology: 1 actor GPU (critic colocated) + 1 rollout GPU ---
+    actor-num-nodes: "1"
+    actor-num-gpus-per-node: "1"
+    num-gpus-per-node: "2"
+    tensor-model-parallel-size: "1"
+    pipeline-model-parallel-size: "1"
+
+    # --- Qwen3-4B-Instruct-2507 architecture: slime scripts/models/qwen3-4B-Instruct-2507.sh ---
+    # Only the flags Reef cannot derive from the HF config.
+    disable-bias-linear: true
+    qk-layernorm: true
+    group-query-attention: true
+    normalization: "RMSNorm"
+    position-embedding-type: "rope"
+    swiglu: true
+    padded-vocab-size: "151936"
+    rotary-base: "5000000"
+
+    # --- LoRA (memory-forced; values from the ceobench SAO config) ---
+    megatron-lora-rank: "32"
+    megatron-lora-alpha: "32"
+    megatron-lora-dropout: "0"
+    megatron-lora-target-modules:
+      - linear_qkv
+      - linear_proj
+      - linear_fc1
+      - linear_fc2
+    # 3 engine adapter slots (Reef docs, evolve-your-model.rst: one per scenario
+    # plus one for the revision being published). The default 1 deadlocked the
+    # step-2 publication: evicting adapter :1 to load :2 waited on the 127
+    # requests still pinned to :1, which the in-place pause had frozen, and the
+    # unload hit its 600 s timeout (run 2026-09-23 17:43, 22:07:54Z). It also
+    # sets max-loras-per-batch, so old- and new-revision requests batch together
+    # instead of draining the engine to one running request before each publish.
+    max-loaded-loras: "3"
+    check-lora-weight-equal: true
+    verify-lora-base-weights: true
+    # --no-offload-train is deliberately NOT set: on one 48 GB card the actor
+    # and the colocated critic cannot both stay resident, and leaving it off
+    # lets Slime offload whichever is idle between critic and actor steps.
+
+    # --- sequence window ---
+    # DeepCoder completions from this model: mean 2,171 tokens in the GRPO
+    # run; the eval protocol allows 16,384. The response cap here keeps the
+    # training step's memory bounded; the driver's SAO_MAX_TOKENS must not
+    # exceed it.
+    seq-length: "16384"
+    rollout-max-response-len: "12288"
+    rollout-max-context-len: "32768"
+    recompute-granularity: "full"
+    recompute-method: "uniform"
+    recompute-num-layers: "1"
+    log-probs-chunk-size: "1024"
+    use-dynamic-batch-size: true
+    max-tokens-per-gpu: "16384"
+    sequence-parallel: false
+    # Offload swap plus a checkpoint save per step can starve SGLang's health
+    # endpoint past the 30 s default (observed on the IMO attempt).
+    rollout-health-check-timeout: "1200"
+    # Rolling window of ~15 bundles; see note 6 in the header.
+    reef-checkpoint-max-storage: "400GB"
+    attention-dropout: "0.0"
+    hidden-dropout: "0.0"
+    attention-softmax-in-fp32: true
+    accumulate-allreduce-grads-in-fp32: true
+
+    # --- OBJECTIVE: upstream imo_answerbench values, unchanged except the
+    #     two LoRA learning rates (10x, keeping the paper's 5:1 critic ratio) ---
+    optimizer: "adam"
+    lr: "5e-5"                         # 5x the first run (1e-5); upstream full-param: 1e-6
+    lr-decay-style: "constant"
+    loss-type: "policy_loss"
+    use-rollout-logprobs: true
+    use-critic: true
+    eps-clip: "0.3"
+    eps-clip-high: "5.0"
+    critic-steps-per-actor: "2"
+    critic-lr: "1e-4"                  # 2x the first run (5e-5); upstream full-param: 5e-6
+    num-critic-only-steps: "10"
+    sao-length-adaptive-lambda: true
+    sao-lambda-alpha: "1.5"
+    gamma: "1.0"
+    lambd: "1.0"
+    entropy-coef: "0.0"
+    n-samples-per-prompt: "1"
+    rollout-temperature: "1.0"
+
+storage:
+  artifact-repository: /var/lib/reef/artifacts.git
+  artifact-work-dir: /var/lib/reef/artifact-work
+  artifact-cache-dir: /var/lib/reef/artifact-cache
+  agent-record-dir: /var/lib/reef/agent-record
+
+observability:
+  wandb:
+    enabled: false
+    project: reef-sao-deepcoder-2507
+    mode: offline
+    directory: /var/lib/reef/wandb
