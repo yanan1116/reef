@@ -45,6 +45,15 @@ if [ -n "${KEEP_DIR:-}" ]; then mkdir -p "$KEEP_DIR"; KEEP_MOUNT=(-v "$KEEP_DIR"
 RUNTIME_ARGS=()
 if [ -n "${DOCKER_RUNTIME:-}" ]; then RUNTIME_ARGS=(--runtime "$DOCKER_RUNTIME"); fi
 
+# Optional: extra module directories for the Reef service, e.g. EXTRA_PYTHONPATH=/repro/finqa so
+# recipe.implementation can name a recipe that lives in exp_scripts (container paths). It is put
+# in front of the image's own PYTHONPATH (SGLang / Megatron entries) inside the container; unset
+# keeps the exact command every earlier run used.
+SERVE_CMD="python3 -m reef serve -c $CFG 2>&1 | tee /var/lib/reef/reef.log"
+if [ -n "${EXTRA_PYTHONPATH:-}" ]; then
+  SERVE_CMD="export PYTHONPATH=$EXTRA_PYTHONPATH\${PYTHONPATH:+:\$PYTHONPATH}; $SERVE_CMD"
+fi
+
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" "${RUNTIME_ARGS[@]}" \
   --gpus all --network host --ipc host --shm-size 32g \
@@ -61,7 +70,7 @@ docker run -d --name "$NAME" "${RUNTIME_ARGS[@]}" \
   -e REEF_SGLANG_HEALTH_TIMEOUT_S=${REEF_SGLANG_HEALTH_TIMEOUT_S:-1200} \
   -w /workspace/Reef \
   "$IMAGE" \
-  bash -c "python3 -m reef serve -c $CFG 2>&1 | tee /var/lib/reef/reef.log"
+  bash -c "$SERVE_CMD"
 # (reef.log lands in $STATE_DIR on the host)
 
 echo "started $NAME from $IMAGE; log: docker logs -f $NAME  (also $STATE_DIR/reef.log)"
