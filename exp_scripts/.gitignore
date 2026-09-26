@@ -3,3 +3,6 @@ data/
 results/
 __pycache__/
 *.pyc
+# FinQA: judge credentials (mode 600) and the local Python env are never versioned.
+finqa/.judge_creds
+.venv-finqa/

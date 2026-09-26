@@ -1,0 +1,26 @@
+Byte-identical copies of the FinQA environment the PRPO FinQA runs used, so SAO and
+PRPO see the same prompt, tools, tool-output truncation, turn limit and judge.
+The SAO code never imports rllm: finqa_env.py loads these files with minimal
+in-memory stand-ins for the three rllm names they reference (a no-op decorator
+and two plain data classes); nothing from rllm is executed.
+
+Source: https://github.com/rllm-org/rllm @ 3b40c37c (2026-09-05), cookbooks/finqa/
+  finqa_constants.py, finqa_tools.py, finqa_flow.py, prompts/*.txt  unchanged upstream files
+  finqa_eval.py  the working-tree version PRPO ran with (local edit of 2026-08-28):
+                 judge model read from FINQA_JUDGE_MODEL (default gpt-5.4-nano; upstream
+                 hardcodes gpt-5-nano, not deployed on our Azure) and up to
+                 FINQA_JUDGE_MAX_ATTEMPTS retries when the judge returns a non-"stop"
+                 finish (upstream scores an empty/truncated judge reply as wrong).
+finqa_flow.py is kept for reference and for its pure helpers (_exec_tool_call,
+_msg_to_dict, _truncate, SYSTEM_PROMPT, MAX_TURNS); its rollout function is not
+used, because SAO must route each model call through Reef for a receipt and must
+set sampling explicitly (in rllm the gateway set it).
+
+sha256:
+cb69f809efe62a2e7e8b140596b8afe07677ef2383142153fbfce10b7f33a04a  finqa_constants.py
+e5223518c16cca938aeb973577b0f1aa507c91deac0c309f99a9b78009727bc7  finqa_tools.py
+ed4b009523fe4e4307693093362ddfb6c122093b1da3ddca76d794c90484876a  finqa_eval.py
+912e496b7562512226d73d9f78ca42637b1ebf7e1ab7076f3af9b5cc0038ff89  finqa_flow.py
+6d91386429071ea6e19ca08e923cb91e62f02b65bc64aa81cb2fbc2ab9ee9194  prompts/correctness_prompt.txt
+da47761f5bc350b14cc95bd4ba10059ef4f0e02844d701aba2a068ed59606e47  prompts/multi_table_correctness_prompt.txt
+a7846033ce02d4d653edd0d80617046764fb8244128d961c9632cdd9e136558e  prompts/react_system_prompt.txt
