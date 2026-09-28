@@ -5,8 +5,9 @@
 # The sidecar publishes adapters atomically (copy to *.incoming, then mv), so a
 # hf_rollout_NNNNN directory that exists on .16 is complete. Each adapter is
 # copied to local disk and its sha256 checked against the source before it is
-# enqueued as lr5x_step_<NNN+1>, twice (a second copy tagged _r2), so the two GPU
-# workers evaluate it in parallel: same latency, two measurements per checkpoint.
+# enqueued as two jobs, lr5x_step_<NNN+1>_t0k4 (T=0, 4 samples per task) and
+# lr5x_step_<NNN+1>_t1k4 (T=1.0, 4 samples per task), so the two GPU workers run
+# them in parallel; the checkpoint's score is the mean over the 8 samples per task.
 #
 # usage: feed_new_checkpoints.sh QUEUE_FILE      (stop: touch QUEUE_FILE.halt; FEED_POLL_S, default 60)
 set -uo pipefail
@@ -29,9 +30,10 @@ while :; do
   [ -e "$STOP" ] && { echo "[feeder] stop file present, exiting $(date '+%F %T %Z')"; break; }
   for name in $("${SSH[@]}" "ls $SRC 2>/dev/null | grep -E '^hf_rollout_[0-9]{5}$'" 2>/dev/null); do
     rid=$((10#${name#hf_rollout_})); tag=$(printf 'lr5x_step_%03d' $((rid + 1)))
-    line="$tag=$DST/$name/hf"
+    line="${tag}_t0k4=$DST/$name/hf"
     # already evaluated, queued, or claimed: nothing to do
-    [ -e "$NFS/$tag" ] && continue
+    [ -e "$NFS/${tag}_t0k4" ] && continue
+    [ -e "$NFS/$tag" ] && continue   # evaluated under the earlier greedy-runs scheme; its results are reused
     grep -qxF -- "$line" "$Q" 2>/dev/null && continue
     grep -qF -- " $line" "$CLAIMED" 2>/dev/null && continue
     if [ ! -f "$DST/$name/hf/adapter_model.safetensors" ]; then
@@ -42,9 +44,9 @@ while :; do
       [ -n "$want" ] && [ "$want" = "$got" ] || { echo "[feeder] sha256 mismatch for $name: src=$want dst=$got"; rm -rf "$DST/$name.incoming"; continue; }
       mv "$DST/$name.incoming" "$DST/$name"
     fi
-    enqueue_front "${tag}_r2=$DST/$name/hf"
+    enqueue_front "${tag}_t1k4=$DST/$name/hf"
     enqueue_front "$line"
-    echo "[feeder] $(date '+%F %T %Z') enqueued $tag and ${tag}_r2 (front)"
+    echo "[feeder] $(date '+%F %T %Z') enqueued ${tag}_t0k4 and ${tag}_t1k4 (front)"
   done
   sleep "${FEED_POLL_S:-60}"
 done
