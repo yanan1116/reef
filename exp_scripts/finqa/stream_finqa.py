@@ -16,8 +16,12 @@ recipes/sao/examples/imo_answerbench/stream.py plus task edits). What differs:
 * The score is rllm's finqa_evaluator (gpt-5.4-nano judge, correctness only).
   It is reported once per episode, referencing every turn's receipt in order, so
   sao_multiturn.MultiTurnSAORecipe assembles the turns into one sample.
-* Reef can only assemble an episode whose turns all came from one engine weight
-  version. An episode that straddles a weight publication is not reported: it
+* An episode Reef cannot assemble into one sample stalls training for good (the
+  SAO processor raises inside ingest). So before reporting, the driver reads
+  every turn's record back (GET /reef/scenarios/<s>/records/<id>) and runs
+  Reef's own make_multi_turn_policy_trajectory on them. An episode it cannot
+  assemble -- turns from different weight versions, a turn generated across a
+  publication, a reply without a version, a token fork -- is not reported: it
   is recorded as dropped and its task goes back into the queue.
 * Failures: an infrastructure error (Reef/engine down, connection, timeout) is
   retried later without reporting, as in the DeepCoder driver; a request the
@@ -30,7 +34,7 @@ Environment (defaults are the FinQA formal run):
   SAO_SCENARIO       Reef scenario (default sao-finqa)
   SAO_BATCH          episodes per optimizer step; = recipe batch-size (default 64)
   SAO_IN_FLIGHT      concurrent episodes (default 64)
-  SAO_BUDGET         reported episodes before the driver stops (default 79360 = 1240 steps x 64)
+  SAO_BUDGET         reported episodes before the driver stops (default 39680 = 620 steps x 64 = 10 epochs)
   SAO_TEMPERATURE, SAO_TOP_P, SAO_MAX_TOKENS   per-turn sampling (0.7, 1.0, 2048)
   SAO_MAX_PROMPT_TOKENS  a longer turn prompt ends the episode unanswered (8192)
   SAO_CALL_TIMEOUT_S one model call through Reef (default 1800)
@@ -44,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -55,7 +60,13 @@ from pathlib import Path
 from reef_client import ReefClient, ReefClientError
 
 HERE = Path(__file__).resolve().parent
+REEF_ROOT = HERE.parents[1]  # the reef fork checkout the image was built from
 sys.path.insert(0, str(HERE))
+# Reef's assembly code, imported from the checkout; tomli_w (its one import this venv lacks) lives in
+# exp_scripts/.reef-deps so the verbatim PRPO venv stays unchanged.
+sys.path[1:1] = [str(REEF_ROOT), str(HERE.parent / ".reef-deps")]
+from reef.core.records_types import AgentRecord, RequestType  # noqa: E402
+from reef.train.processors.common import make_multi_turn_policy_trajectory  # noqa: E402
 from judge_env import load_judge_env  # noqa: E402
 
 load_judge_env()
@@ -68,7 +79,7 @@ RECIPE = "sao"
 
 BATCH = int(os.environ.get("SAO_BATCH", "64"))
 IN_FLIGHT = int(os.environ.get("SAO_IN_FLIGHT", "64"))
-BUDGET = int(os.environ.get("SAO_BUDGET", str(1240 * 64)))
+BUDGET = int(os.environ.get("SAO_BUDGET", str(620 * 64)))
 TEMPERATURE = float(os.environ.get("SAO_TEMPERATURE", "0.7"))
 TOP_P = float(os.environ.get("SAO_TOP_P", "1.0"))
 MAX_TOKENS = int(os.environ.get("SAO_MAX_TOKENS", "2048"))
@@ -80,6 +91,8 @@ TRAIN_DRAIN_TIMEOUT_S = int(os.environ.get("SAO_TRAIN_DRAIN_TIMEOUT_S", "14400")
 PROGRESS_FILE = os.environ.get("SAO_PROGRESS_FILE")
 AHEAD = int(os.environ.get("SAO_AHEAD", "3"))
 STALL_S = int(os.environ.get("SAO_STALL_S", "2700"))
+REALIGN_THRESHOLD = 1024  # = sao_multiturn.MultiTurnSAORecipe realign_threshold
+SCAFFOLD_TOLERANCE = 0    # = sao_multiturn.MultiTurnSAORecipe scaffold_tolerance
 MAX_FAILURE_STREAK = 24
 FAILURE_PAUSE_S = 60
 #: Words in an engine rejection that mean the conversation outgrew the context window: the model's doing.
@@ -201,20 +214,76 @@ def episode_versions(episode: EpisodeResult) -> set[str | None]:
     return {turn.info.get("runtime_load_id") for turn in episode.turns}
 
 
+def fetch_turn_record(agent_record_id: str) -> AgentRecord:
+    """One turn's record as Reef stored it for training (tokens, loss mask, per-token versions)."""
+    request = urllib.request.Request(
+        f"{SERVICE_URL}/reef/scenarios/{SCENARIO}/records/{agent_record_id}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = json.loads(response.read())
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise InfrastructureFailure(f"record {agent_record_id} unreadable: {error}") from error
+    return AgentRecord(
+        agent_record_id=body["agent_record_id"],
+        scenario=SCENARIO,
+        request_type=RequestType(body["request_type"]),
+        payload=body["payload"],
+        created_at=float(body["created_at"]),
+        references=tuple(body.get("references") or ()),
+    )
+
+
+def turn_versions(record: AgentRecord) -> set[str]:
+    """The weight versions of one turn's tokens: its runtime_load_spans, else its single recorded version."""
+    training = (record.payload.get("response") or {}).get("training") or {}
+    spans = training.get("runtime_load_spans") or record.payload.get("runtime_load_spans") or []
+    if spans:
+        return {str(span["runtime_load_id"]) for span in spans}
+    recorded = record.payload.get("runtime_load_id") or training.get("runtime_load_id")
+    return {str(recorded)} if recorded else set()
+
+
+def check_reef_source() -> None:
+    """The assembly imported here must be the image's: the image tag names the Reef source commit."""
+    image = os.environ.get("IMAGE", "")
+    git = ["git", "-C", str(REEF_ROOT), "-c", "safe.directory=*"]
+    commit = subprocess.run([*git, "log", "-1", "--format=%h", "--", ".", ":(exclude)exp_scripts"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    dirty = subprocess.run([*git, "status", "--porcelain", "--", ".", ":(exclude)exp_scripts"],
+                           capture_output=True, text=True, check=True).stdout.strip()
+    if image != f"reef:sao-{commit}" or dirty:
+        raise SystemExit(
+            f"expected IMAGE=reef:sao-{commit} and a clean Reef source tree; got IMAGE={image!r}, "
+            f"uncommitted changes: {dirty or 'none'}. The driver checks episodes with Reef's assembly code "
+            f"from {REEF_ROOT}, which must be the code the stack runs: rebuild the image or check out its commit."
+        )
+
+
 def one_episode(client: ReefClient, model: str, problem: dict, position: int) -> dict:
     started = time.time()
     release = serving_release()
-    steps_before = training_release_count()
     episode = run_episode(ReefChat(client, model), problem["task"]["question"])
     if isinstance(episode.failure, InfrastructureFailure):
         raise episode.failure  # retried later; nothing is reported
-    steps_after = training_release_count()
     versions = episode_versions(episode)
-    if None in versions:
-        # The reply does not name its weight version: any publication during the episode may have split it.
-        straddled = steps_before is None or steps_after is None or steps_before != steps_after
-    else:
-        straddled = len(versions) > 1
+    # Reef assembles only turns that all name one weight version (make_multi_turn_policy_trajectory
+    # returns None for a turn without runtime_load_id, and the SAO processor then raises inside ingest,
+    # stalling training for good). Turns served around a publication can come back without one
+    # (smoke 2026-09-26: 3 of 256 episodes, positions 238-240, at the step-2 publish), so such an
+    # episode is dropped like a straddle; counting training releases instead let those three through.
+    # A turn can also hold tokens of two versions while its reply names only the last one
+    # (smoke 2026-09-26 22:27: position 235, turn 0 tokens 0-70 on :0, 70-148 on :1), and any
+    # episode Reef cannot assemble stalls training for good. So the decision is Reef's own:
+    # read every turn's record back and run the assembly the SAO processor will run.
+    turn_records = [fetch_turn_record(turn.info["receipt"]) for turn in episode.turns]
+    split_turns = sum(len(turn_versions(r)) != 1 for r in turn_records)
+    assemblable = bool(turn_records) and make_multi_turn_policy_trajectory(
+        turn_records, 0.0, source_agent_record_id="driver-check",
+        realign_threshold=REALIGN_THRESHOLD, scaffold_tolerance=SCAFFOLD_TOLERANCE,
+    ) is not None
+    straddled = None in versions or len(versions) > 1 or not assemblable
     record = {
         "position": position,
         "problem_idx": problem["problem_idx"],
@@ -226,6 +295,8 @@ def one_episode(client: ReefClient, model: str, problem: dict, position: int) ->
         "prompt_tokens_last": episode.turns[-1].info.get("prompt_tokens") if episode.turns else None,
         "completion_tokens": sum(turn.info.get("completion_tokens") or 0 for turn in episode.turns),
         "runtime_load_ids": sorted(v for v in versions if v is not None),
+        "turns_without_version": sum(turn.info.get("runtime_load_id") is None for turn in episode.turns),
+        "split_turns": split_turns,
         "serving_release_id": release,
         "agent_record_ids": [turn.info["receipt"] for turn in episode.turns],
         "seconds": round(time.time() - started, 1),
@@ -233,7 +304,9 @@ def one_episode(client: ReefClient, model: str, problem: dict, position: int) ->
     if not episode.turns:
         raise InfrastructureFailure(f"episode ended before its first turn: {record['failure']}")
     if straddled:
-        record.update(dropped="version_straddle", recorded_at=time.time())
+        kind = ("version_missing" if None in versions else "version_split_turn" if split_turns
+                else "version_straddle" if len(versions) > 1 else "unassemblable")
+        record.update(dropped=kind, recorded_at=time.time())
         write_record(record)
         raise VersionStraddle(f"problem {problem['problem_idx']} spans versions {record['runtime_load_ids'] or 'unknown'}")
     score, is_correct, grading = grade(problem["task"], episode)
@@ -304,6 +377,7 @@ def wait_for_training(expected: int) -> None:
 
 
 def main() -> None:
+    check_reef_source()
     problems = load_problems()
     order = problem_order(problems, BUDGET)
     client = ReefClient(SERVICE_URL, token=TOKEN, timeout_s=CALL_TIMEOUT_S)

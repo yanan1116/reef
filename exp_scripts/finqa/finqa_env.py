@@ -141,8 +141,8 @@ class EpisodeResult:
     answer: str
     accessed_tables: list[str]
     turns: list[Turn]
-    ended: str  # "answer" | "max_turns" | "call_failed"
-    failure: Exception | None = None  # the exception that ended a "call_failed" episode
+    ended: str  # "answer" | "max_turns" | "call_failed" | "tool_error"
+    failure: Exception | None = None  # the exception that ended a "call_failed" or "tool_error" episode
 
 
 class ChatModel(ABC):
@@ -202,7 +202,13 @@ def run_episode(chat: ChatModel, question: str) -> EpisodeResult:
         if not tool_calls:
             return EpisodeResult(content, accessed, turns, "answer")
         for tc in tool_calls:
-            output = finqa_flow._exec_tool_call(tool_call_view(tc), accessed)
+            try:
+                output = finqa_flow._exec_tool_call(tool_call_view(tc), accessed)
+            except Exception as error:
+                # finqa_flow lets this escape (e.g. arguments that decode to a JSON string: args.get on a
+                # str, seen 2026-09-27 00:3x in the formal run); rllm's eval runner then records the episode
+                # as TerminationReason.ERROR with reward 0 and is_correct False. Same here: no answer.
+                return EpisodeResult("", accessed, turns, "tool_error", error)
             messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": output})
     return EpisodeResult(turns[-1].content if turns else "", accessed, turns, "max_turns")
 

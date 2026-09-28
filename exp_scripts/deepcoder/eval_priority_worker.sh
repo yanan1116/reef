@@ -27,7 +27,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 LOCK="$Q.lock"; CLAIMED="$Q.claimed"; HALT="$Q.halt"
 NFS=${NFS:?NFS results root required}
 ADAPTERS=${ADAPTERS:-/mnt/disk1t/sao-lr5x-eval/adapters}
-MAX_EVALS=${MAX_EVALS:-6}
+MAX_EVALS=${MAX_EVALS:-3}
 POLL_S=${POLL_S:-20}
 touch "$Q" "$CLAIMED"
 
@@ -124,6 +124,7 @@ while :; do
   log "start $KIND $JOB"
   case "${JOB%%=*}" in
     *_t1k4|*_t1k4_r*) SAMPLING=(EVAL_TEMPERATURE=1.0 EVAL_ATTEMPTS=4 EVAL_SEED=none) ;;
+    *_t0k4|*_t0k4_r*) SAMPLING=(EVAL_TEMPERATURE=0 EVAL_ATTEMPTS=4) ;;   # seed 1234, as the greedy protocol
     *) SAMPLING=() ;;
   esac
   setsid env GPU="$GPU" PORT="$PORT" "${SAMPLING[@]}" bash "$HERE/eval_sao_checkpoints.sh" "$JOB" &

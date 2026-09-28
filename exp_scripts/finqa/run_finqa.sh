@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SAO on FinQA single-table, formal run: Qwen3-4B-Instruct-2507, 64 tasks per
 # step with one rollout each, one sample per multi-turn episode, compared against
-# the PRPO FinQA runs. Planned 20 epochs = 1240 optimizer steps (62 per epoch);
-# stop early from the evaluations if it is not improving.
+# the PRPO FinQA runs. 10 epochs = 620 optimizer steps (62 per epoch; set
+# 2026-09-26, was 20 epochs); stop early from the evaluations if it is not improving.
 #
 # Same shape as deepcoder/run_formal.sh, without rllm: the driver and the
 # checkpoint copier run in exp_scripts/.venv-finqa (finqa/setup_venv.sh), and
@@ -54,7 +54,7 @@ export SAO_PROBLEMS="$HERE/data/finqa_train.jsonl"
 export SAO_SCENARIO=${SAO_SCENARIO:-sao-finqa}
 export SAO_BATCH=64                               # = recipe.config.batch-size in $CFG
 export SAO_IN_FLIGHT=${SAO_IN_FLIGHT:-64}
-export SAO_BUDGET=${SAO_BUDGET:-79360}            # 1240 steps x 64 = 20 epochs of 4030 tasks (62 steps each)
+export SAO_BUDGET=${SAO_BUDGET:-39680}            # 620 steps x 64 = 10 epochs of 4030 tasks (62 steps each)
 export SAO_TEMPERATURE=0.7                        # = rollout-temperature in $CFG (DIS needs them equal)
 export SAO_TOP_P=1.0
 export SAO_MAX_TOKENS=2048                        # per turn, PRPO max_response_length
@@ -68,8 +68,8 @@ export SIDECAR_HF_DIR="$STATE_DIR/checkpoints/hf"
 export SIDECAR_KEEP_DIR="$KEEP_DIR"
 export SIDECAR_LOG="$OUT/sidecar.log"
 export SIDECAR_ADAPTER_EVERY=${SIDECAR_ADAPTER_EVERY:-31}   # every half epoch: what the evaluation reads
-export SIDECAR_FULL_EVERY=${SIDECAR_FULL_EVERY:-155}        # full actor+critic bundle every 5 epochs
-export SIDECAR_FINAL_STEP=${SIDECAR_FINAL_STEP:-1240}
+export SIDECAR_FULL_EVERY=${SIDECAR_FULL_EVERY:-155}        # full actor+critic bundle every 2.5 epochs (155, 310, 465, 620)
+export SIDECAR_FINAL_STEP=${SIDECAR_FINAL_STEP:-620}
 
 "$PY" -u "$REPRO/deepcoder/sidecar.py" > "$OUT/sidecar.stdout" 2>&1 &
 SIDECAR=$!
