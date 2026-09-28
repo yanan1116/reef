@@ -6,6 +6,8 @@
 #   MODE=merged  merge the adapter into the base in bf16 first (PRPO's way), serve that
 #   MODE=base    serve the base model itself (ADAPTER unused)
 #   SAMPLING=greedy  temperature 0, top_p 1.0, seed 1234, 1 attempt (PRPO's protocol)
+#   SAMPLING=t0k4    greedy protocol run 4 times per task (independent requests), scored avg@4;
+#                    vLLM greedy is not deterministic under concurrent batching, so the 4 differ
 #   SAMPLING=t07k4   temperature 0.7 (the training temperature), top_p 1.0, 4 attempts, no seed
 #
 # vLLM flags are the PRPO evaluation's (eval_parallel.sh serve): max-model-len 12288,
@@ -30,8 +32,9 @@ PY="$VENV/bin/python"
 
 case "$SAMPLING" in
   greedy) SAMPLING_ARGS=(--temperature 0 --top-p 1.0 --seed 1234 --attempts 1) ;;
+  t0k4)   SAMPLING_ARGS=(--temperature 0 --top-p 1.0 --seed 1234 --attempts 4) ;;   # greedy x4, avg@4 like t07k4
   t07k4)  SAMPLING_ARGS=(--temperature 0.7 --top-p 1.0 --seed none --attempts 4) ;;
-  *) echo "SAMPLING must be greedy or t07k4" >&2; exit 2 ;;
+  *) echo "SAMPLING must be greedy, t0k4 or t07k4" >&2; exit 2 ;;
 esac
 [ -x "$PY" ] || { echo "$PY missing: run setup_venv.sh" >&2; exit 2; }
 test -f "$BASE/config.json" || { echo "base model not found: $BASE" >&2; exit 2; }
@@ -63,7 +66,13 @@ case "$MODE" in
   *) echo "MODE must be lora, merged or base" >&2; exit 2 ;;
 esac
 
-cleanup() { [ -n "${SPID:-}" ] && { kill -9 -- "-$SPID" 2>/dev/null || true; wait "$SPID" 2>/dev/null || true; }; [ "$MODE" = merged ] && rm -rf -- "$WORK/$TAG/merged"; }
+# The trap's last status becomes the script's exit status, so no bare `[ ... ] &&` may end it
+# (with MODE=lora the merged test returned 1 and every successful evaluation exited 1).
+cleanup() {
+  if [ -n "${SPID:-}" ]; then kill -9 -- "-$SPID" 2>/dev/null || true; wait "$SPID" 2>/dev/null || true; fi
+  if [ "$MODE" = merged ]; then rm -rf -- "$WORK/$TAG/merged"; fi
+  return 0
+}
 trap cleanup EXIT
 setsid "$VENV/bin/vllm" serve "$SERVE_MODEL" --served-model-name base --host 127.0.0.1 --port "$PORT" \
   --tensor-parallel-size 1 --max-model-len 12288 --gpu-memory-utilization 0.85 \
