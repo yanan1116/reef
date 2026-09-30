@@ -1,0 +1,30 @@
+AppWorld react_code environment shared by SAO (reef exp_scripts/appworld/appworld_react) and
+PRPO (rllm exp_scripts/appworld-prpo-run/appworld_react): the same files, byte for byte, in both.
+Check with: sha256sum -c SHA256SUMS (run in this directory).
+
+Protocol source: the grpo_vanilla react_code line behind the vanilla-GRPO AppWorld results
+(Qwen3.5-4B, 50 steps, 24576 completion budget), as its trajectory collector runs it:
+  gitlab/tail/grpo_vanilla @ 73f8652e (clean): scripts/collect_appworld_trajectories.py
+  run_task(modality="code", align_harness=True) with GRPO_VANILLA_APPWORLD_REACT_PROMPT set.
+
+Byte-identical copies:
+  grpo_vanilla/verifier.py            grpo_vanilla/grpo_vanilla/verifier.py @ 73f8652e
+  grpo_vanilla/appworld_verifier.py   grpo_vanilla/grpo_vanilla/appworld_verifier.py @ 73f8652e
+  react_code_instructions.txt         AppWorld @ 42b5bcf experiments/prompts/react_code_agent/instructions.txt
+                                      (sha256 c41f7852...; the prompt the grpo_vanilla probe and formal line used)
+Stand-ins (the only two names verifier.py imports from the rest of grpo_vanilla, same bodies):
+  grpo_vanilla/audit.py  (sha256_text)   grpo_vanilla/judge.py  (JudgeFailure)
+Verbatim in episode.py (checked equal to the grpo_vanilla objects on 2026-09-28):
+  SYSTEM_PROMPT (config.py), EXECUTE_CODE_DESCRIPTION / EXECUTE_CODE_SCHEMA and
+  _render_react_prompt (appworld_environment.py); run_episode follows run_task line for line.
+  One deliberate difference: tool-call arguments that are not valid JSON become {} instead of
+  raising (the collector would abort the task); a ContextOverflow from the stack ends the
+  episode as "context_overflow" and the world is graded as for a truncation.
+
+Parity (test_parity.py, replaying collector-recorded episodes against a live AppWorld server):
+  2026-09-28  2507 train90 T=1.0: 12/12 identical (messages, reward, stop reason)
+              Qwen3.5-4B train90 T=1.0: 8/8 identical, incl. reward 1.0, partial, budget_exhausted
+
+Base references (vLLM, train90, T=1.0, 1 episode/task; reef exp_scripts/results/appworld-measure):
+  Qwen3.5-4B  mean 0.705, >0 85.6%, TGC 44.4%  (formal line's first 6 steps on the same tasks: 0.652 vs ours 0.653)
+  2507        mean 0.054, >0 13.3%, TGC 0.0%

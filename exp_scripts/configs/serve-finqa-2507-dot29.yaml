@@ -1,0 +1,188 @@
+# .29 (RTX 5000 Ada, 32 GB) variant of serve-finqa-2507.yaml: identical except max-tokens-per-gpu 8192
+# (a memory knob: micro-batch packing only; SAO, gradients and data unchanged), as serve-appworld-2507-dot29.yaml.
+# Used for the single-table synchronous-batch rerun on .29 (2026-09-30).
+#
+# SAO (arXiv:2607.07508) on FinQA single-table, Qwen3-4B-Instruct-2507, for a
+# comparison against the PRPO FinQA runs (gitlab/tail/rllm/finqa-prpo-run).
+#
+# Derived from serve-deepcoder-2507-b128.yaml (the DeepCoder SAO run, lr 1e-5):
+# the same model, architecture flags, LoRA, SAO objective settings, engine
+# stability options (max-running-requests 16, watchdog 1800 s, 3 LoRA slots)
+# and trainer memory settings. What changed, and why:
+#
+#  1. Multi-turn episodes. recipe.implementation is exp_scripts/finqa
+#     sao_multiturn:MultiTurnSAORecipe, which only declares
+#     accept-multi-turn-policy-samples so Reef assembles an episode's turns into
+#     one sample; skip-observation GAE then treats the tool outputs as context.
+#  2. Tool calling: SGLang tool-call-parser qwen25 in both the engine options and
+#     the Reef chat handler (the PRPO evaluation used vLLM's hermes parser for the
+#     same <tool_call> format).
+#  3. Matched to PRPO FinQA's data and sampling (train_16_prpo.sh): 64 tasks per
+#     step, one rollout each; temperature 0.7; 2048 new tokens per turn (set per
+#     request by the driver: an assembled episode's response span is several turns
+#     long, so rollout-max-response-len stays at the context size; Slime uses it
+#     only for its default generation length and truncation metrics); 12288
+#     context (max_model_len). The driver also ends an episode whose turn prompt
+#     exceeds 8192 tokens (max_prompt_length). Algorithm settings stay SAO's own
+#     (lr 1e-5 / critic 5e-5, DIS clip 0.3 / 5.0, no KL, no entropy bonus).
+#  4. Durable version every 31 steps (half an epoch); storage cap 400GB.
+#
+# Launch: exp_scripts/finqa/run_finqa.sh (driver: stream_finqa.py).
+
+schema-version: 2
+reef:
+  host: 127.0.0.1
+  port: 8900
+  token: reef-local
+  run-dir: /var/lib/reef/stack
+  ready-timeout: 3600
+
+inference:
+  model-path: /root/models/Qwen3-4B-Instruct-2507
+  num-gpus: "1"
+  tensor-parallel-size: "1"
+  timeout-s: 7200
+  retry-timeout-s: 7200                # upstream serve-30b: requests survive an engine restart
+  retry-max-s: 60
+  options:
+    router-port: "30000"
+    context-length: "12288"          # = PRPO FinQA max_model_len
+    # --- upstream serve-30b.yaml ---
+    disable-radix-cache: true          # "Required by Reef's SGLang inference backend (#432)"
+    incremental-streaming-output: true
+    mem-fraction-static: "0.7"
+    chunked-prefill-size: "4096"
+    max-running-requests: "16"
+    # --- ours ---
+    watchdog-timeout: "1800"
+    tool-call-parser: "qwen25"         # Qwen3-2507 <tool_call>{json}</tool_call> (vLLM: hermes)
+  handler-factory: reef.inference.sglang.chat.SGLangInferenceHandler
+  handler-config:
+    tool_call_parser: qwen25
+
+recipe:
+  implementation: sao_multiturn:MultiTurnSAORecipe   # exp_scripts/finqa, on the container PYTHONPATH
+  config:
+    batch-size: 64                     # = PRPO FinQA train_batch_size; MUST equal global_batch_size and SAO_BATCH
+    max-staleness: 18
+    checkpoint-every-n-versions: 31    # half an epoch (62 steps/epoch at 64 tasks per step)
+    accept-multi-turn-policy-samples: true   # one episode = one sample (skip-observation GAE)
+
+training:
+  backend: slime
+  ready-timeout: 1800
+  timeout-s: 14400
+  config:
+    checkpoint_dir: /var/lib/reef/checkpoints
+    global_batch_size: 64
+  options:
+    megatron-to-hf-mode: "bridge"
+    hf-checkpoint: "${inference.model-path}"
+    load: "${training.config.checkpoint_dir}/megatron"
+    save: "${training.config.checkpoint_dir}/megatron"
+    save-interval: "100"
+    save-hf: "${training.config.checkpoint_dir}/hf/{rollout_id}"
+    num-rollout: "100000000"
+    rollout-batch-size: "${training.config.global_batch_size}"
+    global-batch-size: "${training.config.global_batch_size}"
+    micro-batch-size: "1"
+
+    # --- topology: 1 actor GPU (critic colocated) + 1 rollout GPU ---
+    actor-num-nodes: "1"
+    actor-num-gpus-per-node: "1"
+    num-gpus-per-node: "2"
+    tensor-model-parallel-size: "1"
+    pipeline-model-parallel-size: "1"
+
+    # --- Qwen3-4B-Instruct-2507 architecture: slime scripts/models/qwen3-4B-Instruct-2507.sh ---
+    # Only the flags Reef cannot derive from the HF config.
+    disable-bias-linear: true
+    qk-layernorm: true
+    group-query-attention: true
+    normalization: "RMSNorm"
+    position-embedding-type: "rope"
+    swiglu: true
+    padded-vocab-size: "151936"
+    rotary-base: "5000000"
+
+    # --- LoRA (memory-forced; values from the ceobench SAO config) ---
+    megatron-lora-rank: "32"
+    megatron-lora-alpha: "32"
+    megatron-lora-dropout: "0"
+    megatron-lora-target-modules:
+      - linear_qkv
+      - linear_proj
+      - linear_fc1
+      - linear_fc2
+    # 3 engine adapter slots (Reef docs, evolve-your-model.rst: one per scenario
+    # plus one for the revision being published). The default 1 deadlocked the
+    # step-2 publication: evicting adapter :1 to load :2 waited on the 127
+    # requests still pinned to :1, which the in-place pause had frozen, and the
+    # unload hit its 600 s timeout (run 2026-09-23 17:43, 22:07:54Z). It also
+    # sets max-loras-per-batch, so old- and new-revision requests batch together
+    # instead of draining the engine to one running request before each publish.
+    max-loaded-loras: "3"
+    check-lora-weight-equal: true
+    verify-lora-base-weights: true
+    # --no-offload-train is deliberately NOT set: on one 48 GB card the actor
+    # and the colocated critic cannot both stay resident, and leaving it off
+    # lets Slime offload whichever is idle between critic and actor steps.
+
+    # --- sequence window ---
+    # DeepCoder completions from this model: mean 2,171 tokens in the GRPO
+    # run; the eval protocol allows 16,384. The response cap here keeps the
+    # training step's memory bounded; the driver's SAO_MAX_TOKENS must not
+    # exceed it.
+    seq-length: "16384"
+    rollout-max-response-len: "12288"  # Slime metrics only; the 2048/turn cap is the driver's max_tokens
+    rollout-max-context-len: "12288"   # = PRPO max_model_len
+    recompute-granularity: "full"
+    recompute-method: "uniform"
+    recompute-num-layers: "1"
+    log-probs-chunk-size: "1024"
+    use-dynamic-batch-size: true
+    max-tokens-per-gpu: "8192"    # .29 only (32 GB cards); .16 uses 16384 (micro-batch packing only)
+    sequence-parallel: false
+    # Offload swap plus a checkpoint save per step can starve SGLang's health
+    # endpoint past the 30 s default (observed on the IMO attempt).
+    rollout-health-check-timeout: "1200"
+    # Rolling window of ~15 bundles; see note 6 in the header.
+    reef-checkpoint-max-storage: "400GB"
+    attention-dropout: "0.0"
+    hidden-dropout: "0.0"
+    attention-softmax-in-fp32: true
+    accumulate-allreduce-grads-in-fp32: true
+
+    # --- OBJECTIVE: upstream imo_answerbench values, unchanged except the
+    #     two LoRA learning rates (10x, keeping the paper's 5:1 critic ratio) ---
+    optimizer: "adam"
+    lr: "1e-5"                         # upstream full-param: 1e-6
+    lr-decay-style: "constant"
+    loss-type: "policy_loss"
+    use-rollout-logprobs: true
+    use-critic: true
+    eps-clip: "0.3"
+    eps-clip-high: "5.0"
+    critic-steps-per-actor: "2"
+    critic-lr: "5e-5"                  # upstream full-param: 5e-6
+    num-critic-only-steps: "10"
+    sao-length-adaptive-lambda: true
+    sao-lambda-alpha: "1.5"
+    gamma: "1.0"
+    lambd: "1.0"
+    entropy-coef: "0.0"
+    n-samples-per-prompt: "1"
+    rollout-temperature: "0.7"         # = PRPO FinQA rollout temperature; must match the driver's SAO_TEMPERATURE
+
+storage:
+  artifact-repository: /var/lib/reef/artifacts.git
+  artifact-work-dir: /var/lib/reef/artifact-work
+  artifact-cache-dir: /var/lib/reef/artifact-cache
+  agent-record-dir: /var/lib/reef/agent-record
+
+observability:
+  wandb:
+    enabled: false
+    project: reef-sao-finqa-2507
+    mode: offline
+    directory: /var/lib/reef/wandb

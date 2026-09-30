@@ -6,6 +6,8 @@ attempts. Each difference is paired per task against the base under the same pro
 the mean of per-task differences of 4-attempt means, with a normal 95% CI over tasks.
 A cell whose run has not finished reads "pending".
 
+Epoch = step x 64 / 4030 (the train pool), including the 10 critic-only warm-up steps.
+
 usage: compare_finqa.py [RUN_TAG] [MODE]   (defaults finqa-b64-20260927T004448, lora)
 """
 
@@ -20,6 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "results" / "finqa-eval"
+TASKS_PER_STEP, TRAIN_TASKS = 64, 4030  # epoch = step * 64 / 4030 (one rollout per task, sampled without replacement)
 PROTOCOLS = (("t0k4", "Greedy avg@4"), ("t07k4", "T=0.7 avg@4"))
 
 
@@ -55,13 +58,13 @@ def main() -> None:
     rows = []
     for split in ("val", "test"):
         bases = {key: per_task(ROOT / f"base_{key}" / f"{split}.json") for key, _ in PROTOCOLS}
-        row = [split, "base"]
+        row = [split, "base", "-"]
         for key, _ in PROTOCOLS:
             base = bases[key]
             row += ["pending", "-"] if base is None else [f"{100 * base[1] / base[2]:.1f}% ({base[1]}/{base[2]})", "-"]
         rows.append(row)
         for step in steps:
-            row = [split, f"step {step}"]
+            row = [split, f"step {step}", f"{step * TASKS_PER_STEP / TRAIN_TASKS:.2f}"]
             for key, _ in PROTOCOLS:
                 result = per_task(ROOT / run / f"step_{step:03d}_{mode}_{key}" / f"{split}.json")
                 base = bases[key]
@@ -71,10 +74,11 @@ def main() -> None:
                     row += [f"{100 * result[1] / result[2]:.1f}% ({result[1]}/{result[2]})",
                             "pending" if base is None else paired(result[0], base[0])]
             rows.append(row)
-    header = ["Split", "Checkpoint"]
+    header = ["Split", "Checkpoint", "Epoch"]
     for _, name in PROTOCOLS:
         header += [name, f"{name.split()[0]} diff vs base (95% CI)"]
-    print(f"FinQA SAO ({mode}-served):")
+    print(f"FinQA SAO ({mode}-served), {TASKS_PER_STEP} distinct tasks per step, 1 rollout per task, "
+          f"train pool {TRAIN_TASKS:,} tasks:")
     table(header, rows)
 
 

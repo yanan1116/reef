@@ -5,20 +5,22 @@
 # take turns, so both are never busy at once; both near zero means nothing is running.
 # Two consecutive checks with every GPU under IDLE_PCT append an ALERT line.
 #
-# usage: gpu_monitor.sh [HOST]   (env INTERVAL_S, IDLE_PCT, OUT); stop: kill the pid in $OUT.pid
+# usage: gpu_monitor.sh [HOST|local]   (env INTERVAL_S, IDLE_PCT, OUT, RUN_GLOB); stop: kill the pid in $OUT.pid
 set -uo pipefail
 HOST=${1:-10.225.68.16}
 INTERVAL_S=${INTERVAL_S:-600}
 IDLE_PCT=${IDLE_PCT:-10}
 REPRO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT=${OUT:-$REPRO/results/finqa/gpu_monitor_${HOST##*.}.tsv}
+RUN_GLOB=${RUN_GLOB:-$REPRO/results/finqa/finqa-*}   # the run whose progress.txt gives trained steps
 echo $$ > "$OUT.pid"
 [ -s "$OUT" ] || printf 'time\tgpu0_util\tgpu1_util\tgpu0_mem_mib\tgpu1_mem_mib\ttrained_steps\trun\n' > "$OUT"
 idle_streak=0
 while :; do
-  sample=$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" \
-    "for i in \$(seq 10); do nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits; sleep 1; done" 2>/dev/null)
-  run=$(ls -dt "$REPRO"/results/finqa/finqa-* 2>/dev/null | head -1)
+  probe='for i in $(seq 10); do nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits; sleep 1; done'
+  if [ "$HOST" = local ]; then sample=$(bash -c "$probe" 2>/dev/null)
+  else sample=$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" "$probe" 2>/dev/null); fi
+  run=$(ls -dt $RUN_GLOB 2>/dev/null | head -1)
   steps=$(cat "$run/progress.txt" 2>/dev/null || echo NA)
   if [ -z "$sample" ]; then
     printf '%s\tNA\tNA\tNA\tNA\t%s\t%s\n' "$(date '+%F %T %Z')" "$steps" "${run##*/}" >> "$OUT"
