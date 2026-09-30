@@ -23,6 +23,11 @@ recipes/sao/examples/imo_answerbench/stream.py plus task edits). What differs:
   assemble -- turns from different weight versions, a turn generated across a
   publication, a reply without a version, a token fork -- is not reported: it
   is recorded as dropped and its task goes back into the queue.
+* Synchronous batches (SAO_SYNC_BATCHES=1; default 0 = the streaming mode the formal run
+  finqa-b64-20260927T004448 used): the same barrier as finqa_multitable/stream_multitable.py.
+  Only one optimizer step's episodes are sampled (reported + in flight <= SAO_BATCH, failed or
+  dropped episodes topped up), and the next batch waits until that step is published, so every
+  batch comes from one weight version and nothing is in flight at a publication.
 * Failures: an infrastructure error (Reef/engine down, connection, timeout) is
   retried later without reporting, as in the DeepCoder driver; a request the
   model itself caused to fail (a 4xx, or a context-length rejection) ends the
@@ -38,6 +43,7 @@ Environment (defaults are the FinQA formal run):
   SAO_TEMPERATURE, SAO_TOP_P, SAO_MAX_TOKENS   per-turn sampling (0.7, 1.0, 2048)
   SAO_MAX_PROMPT_TOKENS  a longer turn prompt ends the episode unanswered (8192)
   SAO_CALL_TIMEOUT_S one model call through Reef (default 1800)
+  SAO_SYNC_BATCHES   1: sample each batch with one weight version (see above); 0 (default): stream
   SAO_RECORDS_PATH   one JSON line per episode (reported or dropped)
   SAO_PROGRESS_FILE, SAO_AHEAD, SAO_STALL_S, SAO_SEED, SAO_TRAIN_DRAIN_TIMEOUT_S  as in deepcoder/stream.py
   FINQA_JUDGE_CREDS  judge credentials file (default exp_scripts/finqa/.judge_creds)
@@ -85,6 +91,7 @@ TOP_P = float(os.environ.get("SAO_TOP_P", "1.0"))
 MAX_TOKENS = int(os.environ.get("SAO_MAX_TOKENS", "2048"))
 MAX_PROMPT_TOKENS = int(os.environ.get("SAO_MAX_PROMPT_TOKENS", "8192"))
 CALL_TIMEOUT_S = float(os.environ.get("SAO_CALL_TIMEOUT_S", "1800"))
+SYNC_BATCHES = os.environ.get("SAO_SYNC_BATCHES", "0") == "1"
 RECORDS_PATH = Path(os.environ.get("SAO_RECORDS_PATH", "work/records/finqa.jsonl"))
 SEED = int(os.environ.get("SAO_SEED", "0"))
 TRAIN_DRAIN_TIMEOUT_S = int(os.environ.get("SAO_TRAIN_DRAIN_TIMEOUT_S", "14400"))
@@ -376,6 +383,23 @@ def wait_for_training(expected: int) -> None:
     print(f"WARNING: only {trained}/{expected} steps trained within {TRAIN_DRAIN_TIMEOUT_S}s", flush=True)
 
 
+def wait_for_publication(steps: int) -> None:
+    """Block until ``steps`` training releases exist: the batch just reported has been trained and published."""
+    if steps == 0:
+        # The first batch samples the base; the scenario only exists once its first request arrives,
+        # so asking for its releases before that returns 404 (multi-table sync run, 2026-09-30).
+        return
+    started = time.time()
+    while True:
+        trained = training_release_count()
+        if trained is not None and trained >= steps:
+            print(f"sync: step {steps} published after {time.time() - started:.0f}s; sampling batch {steps + 1}", flush=True)
+            return
+        if time.time() - started > TRAIN_DRAIN_TIMEOUT_S:
+            raise SystemExit(f"sync: step {steps} not published within {TRAIN_DRAIN_TIMEOUT_S}s (trained={trained})")
+        time.sleep(15)
+
+
 def main() -> None:
     check_reef_source()
     problems = load_problems()
@@ -385,7 +409,7 @@ def main() -> None:
     pacer = TrainerPacer(PROGRESS_FILE)
     print(
         f"pool={len(problems)} tasks, budget={BUDGET}, batch={BATCH}, in_flight={IN_FLIGHT}, "
-        f"temperature={TEMPERATURE}, top_p={TOP_P}, max_tokens/turn={MAX_TOKENS}",
+        f"temperature={TEMPERATURE}, top_p={TOP_P}, max_tokens/turn={MAX_TOKENS}, sync_batches={SYNC_BATCHES}",
         flush=True,
     )
 
@@ -422,8 +446,16 @@ def main() -> None:
         queue = list(order)
         position = 0
         while done < BUDGET:
-            while len(pending) < IN_FLIGHT and queue:
-                pacer.wait(done)
+            room = IN_FLIGHT
+            if SYNC_BATCHES:
+                batch = done // BATCH
+                if not pending and done % BATCH == 0:
+                    wait_for_publication(batch)  # nothing in flight: the next batch starts on the new weights
+                room = BATCH - (done - batch * BATCH) - len(pending)  # episodes this batch still needs
+            while len(pending) < IN_FLIGHT and queue and room > 0:
+                if not SYNC_BATCHES:
+                    pacer.wait(done)
+                room -= 1
                 problem = queue.pop(0)
                 future = pool.submit(one_episode, client, model, problem, position)
                 problems_by_future[future] = problem

@@ -39,8 +39,8 @@ for i in $(seq 1 160); do
 done
 curl -sf -m 5 http://127.0.0.1:8900/healthz >/dev/null || { echo "[formal] reef never became healthy" >&2; exit 1; }
 
-export RLLM_HOME=/home/yanan/agents/gitlab/tail/rllm/deepcoder-run/runtime
-export PYTHONPATH="$HERE:$REPRO/vendor:/home/yanan/agents/gitlab/tail/rllm/deepcoder-run:/home/yanan/agents/rllm/cookbooks/deepcoder:/home/yanan/agents/rllm"
+export RLLM_HOME=/home/yanan/agents/rllm/exp_scripts/deepcoder-run/runtime
+export PYTHONPATH="$HERE:$REPRO/vendor:/home/yanan/agents/rllm/exp_scripts/deepcoder-run:/home/yanan/agents/rllm/cookbooks/deepcoder:/home/yanan/agents/rllm"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export SAO_PROBLEMS="$REPRO/data/deepcoder_train.jsonl"
 export SAO_SCENARIO=${SAO_SCENARIO:-sao-deepcoder}

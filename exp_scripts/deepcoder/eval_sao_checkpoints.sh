@@ -22,7 +22,7 @@ GPU=${GPU:-0}
 PORT=${PORT:-18041}
 export EVAL_CONCURRENCY=32
 
-DC=/home/yanan/agents/gitlab/tail/rllm/deepcoder-run
+DC=/home/yanan/agents/rllm/exp_scripts/deepcoder-run
 EXPECT_IP=${EXPECT_IP:-10.225.68.24}
 BASE=${BASE:-/home/yanan/reef-sao/models/Qwen3-4B-Instruct-2507}   # sha256-identical to the .29 base snapshot
 WORK=${WORK:-/home/yanan/reef-sao-deepcoder/eval}                   # host-local disk: 16 GiB episodes files
