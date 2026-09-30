@@ -54,23 +54,37 @@ if [ -n "${EXTRA_PYTHONPATH:-}" ]; then
   SERVE_CMD="export PYTHONPATH=$EXTRA_PYTHONPATH\${PYTHONPATH:+:\$PYTHONPATH}; $SERVE_CMD"
 fi
 
+# Optional: STACK_GPUS=0 (a comma list of host GPU indices) gives the container only those GPUs,
+# e.g. a colocated single-GPU stack on .29 that leaves GPU 1 to evaluation. Unset keeps the exact
+# earlier command (all GPUs, CUDA_VISIBLE_DEVICES=0,1).
+if [ -n "${STACK_GPUS:-}" ]; then
+  GPU_ARGS=(--gpus "\"device=$STACK_GPUS\"")
+  VISIBLE=$(seq -s, 0 $(( $(tr ',' '\n' <<< "$STACK_GPUS" | wc -l) - 1 )))  # renumbered from 0 inside
+else
+  GPU_ARGS=(--gpus all)
+  VISIBLE=0,1
+fi
+
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" "${RUNTIME_ARGS[@]}" \
-  --gpus all --network host --ipc host --shm-size 32g \
+  "${GPU_ARGS[@]}" --network host --ipc host --shm-size 32g \
   -v /home/yanan/reef-sao/models:/root/models \
   -v "$STATE_DIR":/var/lib/reef \
   "${KEEP_MOUNT[@]}" \
   -v /home/yanan/reef-sao/data:/root/data \
   -v "$REPRO":/repro \
-  -e CUDA_VISIBLE_DEVICES=0,1 \
+  -e CUDA_VISIBLE_DEVICES=$VISIBLE \
   -e NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1} \
   ${NVTE_DEBUG:+-e NVTE_DEBUG=$NVTE_DEBUG -e NVTE_DEBUG_LEVEL=${NVTE_DEBUG_LEVEL:-2}} \
   -e PYTHONUNBUFFERED=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e REEF_SGLANG_HEALTH_TIMEOUT_S=${REEF_SGLANG_HEALTH_TIMEOUT_S:-1200} \
+  -e REEF_BF16_LOGITS=${REEF_BF16_LOGITS:-0} \
   -w /workspace/Reef \
   "$IMAGE" \
   bash -c "$SERVE_CMD"
 # (reef.log lands in $STATE_DIR on the host)
+# REEF_BF16_LOGITS=1 keeps the policy's vocabulary logits bf16 instead of Megatron's fp32 upcast
+# (docker/patch/mcore_bf16_logits.py; images from that commit on). Default 0 = unchanged.
 
 echo "started $NAME from $IMAGE; log: docker logs -f $NAME  (also $STATE_DIR/reef.log)"

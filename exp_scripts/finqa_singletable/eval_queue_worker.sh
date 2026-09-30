@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One evaluation worker per .29 GPU for the FinQA SAO formal run: repeatedly take the
-# highest-priority unevaluated job for the adapters kept on the training host, copy the
-# adapter here, and run eval_finqa_checkpoint.sh on it. Never idles while work exists;
+# highest-priority unevaluated job for the adapters kept on the training host, read the
+# adapter in place, and run eval_finqa_checkpoint.sh on it. Never idles while work exists;
 # polls for new adapters every POLL_S when there is none.
 #
 # Jobs, in priority order (step = rollout_id + 1):
@@ -16,28 +16,31 @@
 # A job is claimed atomically by mkdir in $CLAIMS; a failed job keeps its claim (not retried)
 # and is logged with FAILED. Stop: touch $CLAIMS/HALT (workers exit between jobs).
 #
-# usage: eval_queue_worker.sh GPU PORT   (env RUN_TAG, TRAIN_HOST, POLL_S)
+# Adapters are read in place from SRC (a local kept-checkpoints dir, or .16's /works/yanan through
+# the read-only sshfs mount of scripts/mount_dot16_works.sh), never copied (2026-09-30). The default
+# is the .29 synchronous-batch rerun; its adapters are on this host's disk.
+#
+# usage: eval_queue_worker.sh GPU PORT   (env RUN_TAG, SRC, POLL_S)
 set -uo pipefail
 GPU=${1:?usage: $0 GPU PORT}
 PORT=${2:?usage: $0 GPU PORT}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPRO="$(cd "$HERE/.." && pwd)"
-RUN_TAG=${RUN_TAG:-finqa-b64-20260927T004448}
-TRAIN_HOST=${TRAIN_HOST:-10.225.68.16}
-SRC=/home/yanan/reef-sao-finqa/kept-checkpoints/adapters
+RUN_TAG=${RUN_TAG:-finqa-sync-b64-20260930T125533}
+SRC=${SRC:-/mnt/disk1t/reef-sao-finqa-sync/kept-checkpoints/adapters}
 BASEDIR=/mnt/disk1t/sao-finqa-eval
-ADAPTERS=$BASEDIR/adapters/$RUN_TAG
 CLAIMS=$BASEDIR/claims/$RUN_TAG
 OUT_ROOT=$REPRO/results/finqa-eval/$RUN_TAG
 BASE_OUT_ROOT=$REPRO/results/finqa-eval
 POLL_S=${POLL_S:-300}
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o Compression=no -c aes128-gcm@openssh.com "$TRAIN_HOST")
-mkdir -p "$ADAPTERS" "$CLAIMS" "$OUT_ROOT"
+mkdir -p "$CLAIMS" "$OUT_ROOT"
+timeout 20 ls "$SRC" >/dev/null 2>&1 || {
+  echo "[worker gpu$GPU] expected the adapter dir $SRC to be readable (for .16's disk: scripts/mount_dot16_works.sh)" >&2; exit 1; }
 log() { echo "[worker gpu$GPU $(date '+%F %T %Z')] $*"; }
 
 next_job() {  # prints "tag step mode sampling" of the best unclaimed job, or nothing
   local rids
-  rids=$("${SSH[@]}" "ls $SRC 2>/dev/null | grep -E '^hf_rollout_[0-9]{5}$'" 2>/dev/null | sed 's/hf_rollout_//' | sort -n) || return 0
+  rids=$(ls "$SRC" 2>/dev/null | grep -E '^hf_rollout_[0-9]{5}$' | sed 's/hf_rollout_//' | sort -n) || return 0
   [ -n "$rids" ] || return 0
   local steps=() s
   for r in $rids; do steps+=($((10#$r + 1))); done
@@ -74,13 +77,9 @@ while :; do
     continue
   fi
   rid=$(printf '%05d' $((step - 1)))
-  dest=$ADAPTERS/hf_rollout_$rid
-  if [ ! -f "$dest/hf/adapter_model.safetensors" ]; then
-    mkdir -p "$dest.incoming"
-    if ! "${SSH[@]}" "tar -C $SRC/hf_rollout_$rid -cf - hf" | tar -C "$dest.incoming" -xf -; then
-      log "FAILED $tag: adapter copy from $TRAIN_HOST"; rm -rf "$dest.incoming"; continue
-    fi
-    rm -rf "$dest"; mv "$dest.incoming" "$dest"
+  dest=$SRC/hf_rollout_$rid  # read in place (no copy)
+  if [ ! -f "$dest/hf/adapter_model.safetensors" ] || [ ! -f "$dest/hf/adapter_config.json" ]; then
+    log "FAILED $tag: expected $dest/hf/{adapter_model.safetensors,adapter_config.json}; not readable"; continue
   fi
   log "begin $tag"
   if GPU=$GPU PORT=$PORT MODE=$mode SAMPLING=$sampling OUT_ROOT=$OUT_ROOT WORK=$BASEDIR/work \

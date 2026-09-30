@@ -1,0 +1,18 @@
+Byte-identical copies of the FinQA multi-table v2 rollout protocol the rllm multi-table lines
+trained and were evaluated with, so SAO and PRPO see the same system prompt, public-question
+builder, tool execution, turn budgets, budget-checkpoint and finalization messages.
+
+Source: /home/yanan/agents/rllm (branch prpo) @ efb4695a, exp_scripts/finqa-multitable-v2/
+  multitable_v2_flow.py                     protocol finqa-multitable-visible-complete-v2
+  prompts/multitable_v2_system_prompt.txt
+
+The hashes in SHA256SUMS equal flow_sha256 / policy_prompt_sha256 in every rllm multi-table
+evaluation manifest (e.g. outputs/prpo-multitrain-b64-24-local/*/protocol_manifest.json).
+Tools and judge are finqa/rllm_finqa (finqa_tools.py, finqa_eval.py: byte-identical to rllm
+cookbooks/finqa). rllm itself is never imported: finqa/finqa_env.py installs the stand-ins.
+
+finqa_multitable/multitable_env.py runs this flow's loop turn for turn with the model call
+injected (SAO routes each call through Reef for a receipt). One deliberate difference, decided
+2026-09-29: the final-synthesis calls keep the tool list (the flow drops it), because a changed
+tool block changes the rendered system prompt and Reef could not assemble the episode into one
+sample. The closing instruction still tells the model to make no tool calls.
