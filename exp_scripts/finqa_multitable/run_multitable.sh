@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SAO on FinQA multi-table (rllm's multi-table v2 protocol), formal run: Qwen3-4B-Instruct-2507,
 # 64 tasks per step with one rollout each, one sample per multi-turn episode, compared against the
-# rllm multi-table lines. 10 epochs of multi_train (991) = 155 optimizer steps (set 2026-09-29).
+# rllm multi-table lines. 10 epochs of multi_train (991) = 10 x floor(991/64) = 150 optimizer steps (rllm drop_last epoch,
+# as single-table 10 x 62 = 620; set 2026-09-30).
 #
 # finqa/run_finqa.sh with the benchmark swapped: same image, recipe (finqa/sao_multiturn.py, loaded
 # from /repro/finqa), venv, judge credentials and checkpoint copier. Every 5th step's adapter is kept
@@ -62,7 +63,7 @@ export SAO_PROBLEMS="$HERE/data/multi_train.jsonl"
 export SAO_SCENARIO=${SAO_SCENARIO:-sao-finqa-multitable}
 export SAO_BATCH=64                               # = recipe.config.batch-size in $CFG
 export SAO_IN_FLIGHT=${SAO_IN_FLIGHT:-64}
-export SAO_BUDGET=${SAO_BUDGET:-9920}             # 155 steps x 64 = 10 epochs of 991 tasks
+export SAO_BUDGET=${SAO_BUDGET:-9600}             # 150 steps x 64 = 10 epochs of 991 tasks (15 steps each)
 export SAO_TEMPERATURE=0.7                        # = rollout-temperature in $CFG (DIS needs them equal)
 export SAO_TOP_P=1.0
 export SAO_CONTEXT_TOKENS=49152                   # = context-length in $CFG
@@ -75,8 +76,8 @@ export SIDECAR_HF_DIR="$STATE_DIR/checkpoints/hf"
 export SIDECAR_KEEP_DIR="$KEEP_DIR"
 export SIDECAR_LOG="$OUT/sidecar.log"
 export SIDECAR_ADAPTER_EVERY=${SIDECAR_ADAPTER_EVERY:-5}    # ~3 per epoch: what the evaluation reads
-export SIDECAR_FULL_EVERY=${SIDECAR_FULL_EVERY:-31}         # with the durable versions (31, 62, ..., 155)
-export SIDECAR_FINAL_STEP=${SIDECAR_FINAL_STEP:-155}
+export SIDECAR_FULL_EVERY=${SIDECAR_FULL_EVERY:-30}         # every 2 epochs, on durable versions (30, 60, ..., 150)
+export SIDECAR_FINAL_STEP=${SIDECAR_FINAL_STEP:-150}
 
 "$PY" -u "$REPRO/deepcoder/sidecar.py" > "$OUT/sidecar.stdout" 2>&1 &
 SIDECAR=$!

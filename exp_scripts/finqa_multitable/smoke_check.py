@@ -34,7 +34,7 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-FORMAL_STEPS = 155
+FORMAL_STEPS = 150
 
 
 def main() -> None:
