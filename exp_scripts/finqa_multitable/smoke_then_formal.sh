@@ -2,7 +2,7 @@
 # On the training host: a 4-step FinQA multi-table SAO smoke run
 # (configs/serve-finqa-multitable-2507-smoke.yaml, 256 episodes), checked by smoke_check.py; only if
 # every check passes, the smoke's Reef checkpoint tree is deleted and the formal run
-# (run_multitable.sh, 155 steps = 10 epochs of 991) starts. finqa/smoke_then_formal.sh with the
+# (run_multitable.sh, 150 steps = 10 epochs of 991) starts. finqa/smoke_then_formal.sh with the
 # benchmark swapped.
 #
 # Refuses to start while any reef-sao-stack container exists or a GPU holds memory:
