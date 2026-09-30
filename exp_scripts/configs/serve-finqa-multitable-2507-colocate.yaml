@@ -40,7 +40,7 @@ recipe:
   config:
     batch-size: 64                     # = PRPO FinQA train_batch_size; MUST equal global_batch_size and SAO_BATCH
     max-staleness: 18
-    checkpoint-every-n-versions: 8     # ~half an epoch (15.5 steps/epoch at 64 of 991 tasks), as single-table's 31 of 62
+    checkpoint-every-n-versions: 10    # 2/3 epoch (15 steps/epoch); divides the final step 150 and the full-bundle cadence 30
     accept-multi-turn-policy-samples: true   # one episode = one sample (skip-observation GAE)
 
 training:

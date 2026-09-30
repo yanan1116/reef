@@ -13,8 +13,8 @@
 #     8192-token final answer. Per-call caps (2048 tool-use / 8192 final) are the driver's.
 #  2. fp32 policy logits, as single-table (REEF_BF16_LOGITS=0): the bf16-logits patch trips Slime's
 #     fp32 assertion in get_log_probs_and_entropy on the first actor step (smoke 2026-09-29).
-#  3. 10 epochs of 991 tasks = 155 steps; a durable Reef version every 8 steps (~half an epoch,
-#     as single-table); the checkpoint copier keeps every 5th step's adapter for evaluation.
+#  3. 10 epochs of 991 tasks = 10 x floor(991/64) = 150 steps; a durable Reef version every 10 steps
+#     (divides 150); the checkpoint copier keeps every 5th step's adapter for evaluation.
 #
 # Launch: exp_scripts/finqa_multitable/run_multitable.sh (driver: stream_multitable.py).
 
@@ -54,7 +54,7 @@ recipe:
   config:
     batch-size: 64                     # = PRPO FinQA train_batch_size; MUST equal global_batch_size and SAO_BATCH
     max-staleness: 18
-    checkpoint-every-n-versions: 8     # ~half an epoch (15.5 steps/epoch at 64 of 991 tasks), as single-table's 31 of 62
+    checkpoint-every-n-versions: 10    # 2/3 epoch (15 steps/epoch); divides the final step 150 and the full-bundle cadence 30
     accept-multi-turn-policy-samples: true   # one episode = one sample (skip-observation GAE)
 
 training:

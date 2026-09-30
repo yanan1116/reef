@@ -44,7 +44,7 @@ Environment (defaults are the multi-table formal run):
   SAO_SCENARIO       Reef scenario (default sao-finqa-multitable)
   SAO_BATCH          episodes per optimizer step; = recipe batch-size (default 64)
   SAO_IN_FLIGHT      concurrent episodes (default 64)
-  SAO_BUDGET         reported episodes before the driver stops (default 9920 = 155 steps x 64 = 10 epochs of 991)
+  SAO_BUDGET         reported episodes before the driver stops (default 9600 = 150 steps x 64 = 10 epochs of 991, 15 steps each)
   SAO_TEMPERATURE, SAO_TOP_P   per-call sampling (0.7, 1.0)
   SAO_CONTEXT_TOKENS served context (default 49152 = the recipe's context-length and rllm's max_model_len)
   SAO_MAX_SAMPLE_TOKENS  longest assembled sample reported for training (default 16384)
@@ -96,7 +96,7 @@ RECIPE = "sao"
 
 BATCH = int(os.environ.get("SAO_BATCH", "64"))
 IN_FLIGHT = int(os.environ.get("SAO_IN_FLIGHT", "64"))
-BUDGET = int(os.environ.get("SAO_BUDGET", str(155 * 64)))
+BUDGET = int(os.environ.get("SAO_BUDGET", str(150 * 64)))
 TEMPERATURE = float(os.environ.get("SAO_TEMPERATURE", "0.7"))
 TOP_P = float(os.environ.get("SAO_TOP_P", "1.0"))
 CONTEXT_TOKENS = int(os.environ.get("SAO_CONTEXT_TOKENS", "49152"))
