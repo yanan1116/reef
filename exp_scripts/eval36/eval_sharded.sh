@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Evaluate one model on FinQA single-table (val, test) or multi-table (multi_val, multi_test) on the
+# evaluation host .36, sharding the tasks across its free GPUs: one vLLM server per GPU group, each
+# group runs eval_finqa.py / eval_multitable.py --shard i/n, and merge_eval_shards.py joins the shards.
+#
+# The protocol is finqa_singletable/eval_finqa_checkpoint.sh's and finqa_multitable/
+# eval_multitable_checkpoint.sh's (same sampling settings, vLLM flags, judge, adapter check), with
+# two host-forced differences, stated in every result's protocol.json:
+#   --dtype half    .36's Quadro RTX 5000 (Turing, sm_75) has no bf16; every other host serves bf16
+#   tensor parallel multi-table's 49152-token context does not fit one 16 GB card: groups of 2 GPUs
+#
+# .36 reads code, the venv and adapters read-only from other hosts (scripts/mount_eval_host_36.sh)
+# and keeps only base models; this script's work tree is temporary and removed after merging.
+#
+# usage: eval_sharded.sh single|multi TAG [ADAPTER_DIR]
+#   env: MODE (base|lora, default base), SAMPLING (greedy|t0k4|t07k4), GPU_GROUPS (default
+#        "0 2 3 7" for single, "0,2 3,7" for multi), PORT_BASE (18100), BASE, TOOL_PARSER,
+#        CHAT_TEMPLATE, CHAT_TEMPLATE_KWARGS, OUT_ROOT (/home/yanan/eval36/results/<bench>),
+#        WORK (/home/yanan/eval36/work)
+set -euo pipefail
+BENCH=${1:?usage: $0 single|multi TAG [ADAPTER_DIR]}
+TAG=${2:?usage: $0 single|multi TAG [ADAPTER_DIR]}
+ADAPTER=${3:-}
+MODE=${MODE:-base}
+SAMPLING=${SAMPLING:-greedy}
+PORT_BASE=${PORT_BASE:-18100}
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPRO="$(cd "$HERE/.." && pwd)"
+VENV=${FINQA_VENV:-$REPRO/.venv-finqa}
+PY="$VENV/bin/python"
+BASE=${BASE:-/home/yanan/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554}
+WORK=${WORK:-/home/yanan/eval36/work}
+case "$BENCH" in
+  single) SRC="$REPRO/finqa_singletable"; EVAL="$SRC/eval_finqa.py"; SPLITS=(val test); MAX_LEN=12288
+          GPU_GROUPS=${GPU_GROUPS:-"0 2 3 7"} ;;
+  multi)  SRC="$REPRO/finqa_multitable"; EVAL="$SRC/eval_multitable.py"; SPLITS=(multi_val multi_test); MAX_LEN=49152
+          GPU_GROUPS=${GPU_GROUPS:-"0,2 3,7"} ;;
+  *) echo "first argument must be single or multi" >&2; exit 2 ;;
+esac
+OUT_ROOT=${OUT_ROOT:-/home/yanan/eval36/results/$BENCH}
+OUT="$OUT_ROOT/$TAG"
+TOOL_PARSER=${TOOL_PARSER:-hermes}
+case "$SAMPLING" in
+  greedy) SAMPLING_ARGS=(--temperature 0 --top-p 1.0 --seed 1234 --attempts 1) ;;
+  t0k4)   SAMPLING_ARGS=(--temperature 0 --top-p 1.0 --seed 1234 --attempts 4) ;;
+  t07k4)  SAMPLING_ARGS=(--temperature 0.7 --top-p 1.0 --seed none --attempts 4) ;;
+  *) echo "SAMPLING must be greedy, t0k4 or t07k4" >&2; exit 2 ;;
+esac
+read -r -a GPU_SETS <<< "$GPU_GROUPS"  # (GROUPS is a bash special variable)
+N=${#GPU_SETS[@]}
+[ -x "$PY" ] || { echo "expected $PY (is the read-only mount of .29:/home/yanan/agents up?)" >&2; exit 2; }
+test -f "$BASE/config.json" || { echo "base model not found: $BASE" >&2; exit 2; }
+[ -e "$OUT" ] && { echo "$OUT exists; refusing to overwrite" >&2; exit 2; }
+SERVE_ARGS=()
+MODEL_NAME=base
+if [ "$MODE" = lora ]; then
+  test -f "$ADAPTER/adapter_model.safetensors" -a -f "$ADAPTER/adapter_config.json" || { echo "not a PEFT adapter: $ADAPTER" >&2; exit 2; }
+  R=$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['r'])" "$ADAPTER/adapter_config.json")
+  SERVE_ARGS=(--enable-lora --max-lora-rank "$R" --max-loras 1 --lora-modules "ckpt=$ADAPTER")
+  MODEL_NAME=ckpt
+elif [ "$MODE" != base ]; then
+  echo "MODE must be base or lora" >&2; exit 2
+fi
+TEMPLATE_ARGS=()
+[ -n "${CHAT_TEMPLATE:-}" ] && TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE")
+KWARGS_ARGS=()
+[ -n "${CHAT_TEMPLATE_KWARGS:-}" ] && KWARGS_ARGS=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
+mkdir -p "$OUT" "$WORK/$TAG"
+
+PIDS=()
+cleanup() {
+  for pid in "${PIDS[@]}"; do kill -9 -- "-$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+  return 0
+}
+trap cleanup EXIT
+for i in "${!GPU_SETS[@]}"; do
+  gpus=${GPU_SETS[$i]}
+  tp=$(tr ',' '\n' <<< "$gpus" | wc -l)
+  port=$((PORT_BASE + i))
+  if curl -fsS -m 3 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; then echo "port $port is in use" >&2; exit 2; fi
+  CUDA_VISIBLE_DEVICES=$gpus setsid "$VENV/bin/vllm" serve "$BASE" --served-model-name base --host 127.0.0.1 --port "$port" \
+    --tensor-parallel-size "$tp" --max-model-len "$MAX_LEN" --gpu-memory-utilization 0.85 --dtype half \
+    --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" "${SERVE_ARGS[@]}" \
+    > "$OUT/server_$i.log" 2>&1 &
+  PIDS+=($!)
+done
+for i in "${!GPU_SETS[@]}"; do
+  port=$((PORT_BASE + i))
+  for ((t=0; t<600; t++)); do
+    kill -0 "${PIDS[$i]}" 2>/dev/null || { echo "[$TAG] vLLM $i (GPUs ${GPU_SETS[$i]}) exited before ready; see $OUT/server_$i.log" >&2; exit 1; }
+    curl -fsS "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -fsS "http://127.0.0.1:$port/v1/models" >/dev/null
+done
+echo "[$TAG] $BENCH mode=$MODE sampling=$SAMPLING $N servers ready (groups: $GPU_GROUPS) $(date '+%F %T %Z')"
+
+for split in "${SPLITS[@]}"; do
+  SHARD_PIDS=()
+  for i in "${!GPU_SETS[@]}"; do
+    FINQA_JUDGE_FINISH_LOG="$OUT/judge_finish_${split}_$i.tsv" FINQA_MULTI_TABLE_JUDGE_MODEL=gpt-5.4-nano "$PY" -u "$EVAL" \
+      --base-url "http://127.0.0.1:$((PORT_BASE + i))/v1" --model "$MODEL_NAME" --split "$split" \
+      --output "$WORK/$TAG/$split/shard_$i" --shard "$i/$N" "${SAMPLING_ARGS[@]}" "${KWARGS_ARGS[@]}" \
+      > "$OUT/eval_${split}_$i.log" 2>&1 &
+    SHARD_PIDS+=($!)
+  done
+  for pid in "${SHARD_PIDS[@]}"; do wait "$pid" || { echo "[$TAG] a $split shard failed; see $OUT/eval_${split}_*.log" >&2; exit 1; }; done
+  shard_dirs=()
+  for i in "${!GPU_SETS[@]}"; do shard_dirs+=("$WORK/$TAG/$split/shard_$i"); done
+  "$PY" "$REPRO/finqa_multitable/merge_eval_shards.py" "$WORK/$TAG/$split/merged" "${shard_dirs[@]}" | tee "$OUT/merge_$split.log"
+  GPU_GROUPS_USED="$GPU_GROUPS" "$PY" - "$WORK/$TAG/$split/merged/protocol.json" "$OUT/${split}_protocol.json" <<'PY'
+import json, sys
+protocol = json.load(open(sys.argv[1]))
+protocol.update(host=".36 Quadro RTX 5000 (sm_75)", dtype="float16", gpu_groups=__import__("os").environ.get("GPU_GROUPS_USED"))
+json.dump(protocol, open(sys.argv[2], "w"), indent=2)
+PY
+  cp "$WORK/$TAG/$split/merged/result.json" "$OUT/$split.json"
+done
+rm -rf -- "${WORK:?}/$TAG"   # temporary: only the merged results and logs under $OUT are kept
+echo "[$TAG] done $(date '+%F %T %Z'); results in $OUT"
