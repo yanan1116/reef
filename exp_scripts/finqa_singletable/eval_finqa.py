@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import math
 import sys
 import time
@@ -42,14 +43,16 @@ EXPECTED_TASKS = {"val": 522, "test": 558}
 class VllmChat(ChatModel):
     """One FinQA turn against an OpenAI-compatible vLLM server, with the evaluation sampling."""
 
-    def __init__(self, client: openai.OpenAI, model: str, sampling: dict) -> None:
+    def __init__(self, client: openai.OpenAI, model: str, sampling: dict, template_kwargs: dict | None = None) -> None:
         self.client = client
         self.model = model
         self.sampling = sampling
+        self.extra_body = {"chat_template_kwargs": template_kwargs} if template_kwargs else None
 
     def complete(self, messages: list[dict]) -> tuple[dict, dict]:
         response = self.client.chat.completions.create(
-            model=self.model, messages=messages, tools=TOOL_SPECS, timeout=CALL_TIMEOUT_S, **self.sampling
+            model=self.model, messages=messages, tools=TOOL_SPECS, timeout=CALL_TIMEOUT_S,
+            extra_body=self.extra_body, **self.sampling
         )
         choice = response.choices[0]
         usage = response.usage
@@ -79,8 +82,10 @@ def main() -> None:
     parser.add_argument("--seed", default="1234")
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=32)
+    parser.add_argument("--chat-template-kwargs", default=None,
+                        help="JSON, e.g. '{\"enable_thinking\": false}' for Qwen3.5 (as eval_multitable.py)")
     parser.add_argument("--shard", default="0/1",
-                        help="i/n: evaluate the tasks at positions k with k %% n == i (one GPU of n); merge with merge_eval_shards.py")
+                        help="i/n: evaluate a random (seed 0) 1/n of the tasks (one GPU of n); merge with merge_eval_shards.py")
     args = parser.parse_args()
     if args.attempts > 1 and args.temperature > 0 and args.seed != "none":
         parser.error("--attempts > 1 at --temperature > 0 needs --seed none, or every attempt repeats one sample")
@@ -92,7 +97,10 @@ def main() -> None:
     shard_index, shard_count = (int(part) for part in args.shard.split("/"))
     if not 0 <= shard_index < shard_count:
         parser.error(f"--shard {args.shard}: expected i/n with 0 <= i < n")
-    rows = [row for position, row in enumerate(rows) if position % shard_count == shard_index]
+    # Random but reproducible 1/n of the tasks per GPU: shuffle positions with a fixed seed, deal them out.
+    order = list(range(len(rows)))
+    random.Random(0).shuffle(order)
+    rows = [rows[position] for position in sorted(order[shard_index::shard_count])]
     sampling: dict = {"temperature": args.temperature, "top_p": args.top_p}
     if args.seed != "none":
         sampling["seed"] = int(args.seed)
@@ -102,9 +110,12 @@ def main() -> None:
         "model": args.model, "split": args.split, "tasks": len(rows), "shard": args.shard, "attempts": args.attempts,
         "sampling": sampling, "max_tokens": None, "call_timeout_s": CALL_TIMEOUT_S, "concurrency": args.concurrency,
     }
+    template_kwargs = json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else None
+    if template_kwargs:  # absent otherwise, so 2507 protocols stay byte-identical
+        protocol["chat_template_kwargs"] = template_kwargs
     (out / "protocol.json").write_text(json.dumps(protocol, indent=2))
     client = openai.OpenAI(base_url=args.base_url, api_key="EMPTY", max_retries=2)
-    chat = VllmChat(client, args.model, sampling)
+    chat = VllmChat(client, args.model, sampling, template_kwargs)
 
     def evaluate(job: tuple[int, dict]) -> dict:
         attempt, row = job

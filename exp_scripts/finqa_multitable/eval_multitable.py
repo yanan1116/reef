@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import math
 import os
 import sys
@@ -87,7 +88,7 @@ def main() -> None:
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--shard", default="0/1",
-                        help="i/n: evaluate the tasks at positions k with k %% n == i (one GPU of n); merge with merge_eval_shards.py")
+                        help="i/n: evaluate a random (seed 0) 1/n of the tasks (one GPU of n); merge with merge_eval_shards.py")
     parser.add_argument("--chat-template-kwargs", default=None)
     args = parser.parse_args()
     template_kwargs = json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else None
@@ -101,7 +102,10 @@ def main() -> None:
     shard_index, shard_count = (int(part) for part in args.shard.split("/"))
     if not 0 <= shard_index < shard_count:
         parser.error(f"--shard {args.shard}: expected i/n with 0 <= i < n")
-    rows = [row for position, row in enumerate(rows) if position % shard_count == shard_index]
+    # Random but reproducible 1/n of the tasks per GPU: shuffle positions with a fixed seed, deal them out.
+    order = list(range(len(rows)))
+    random.Random(0).shuffle(order)
+    rows = [rows[position] for position in sorted(order[shard_index::shard_count])]
     sampling: dict = {"temperature": args.temperature, "top_p": args.top_p}
     if args.seed != "none":
         sampling["seed"] = int(args.seed)

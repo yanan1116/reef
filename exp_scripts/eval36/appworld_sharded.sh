@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AppWorld (react_code, official prompt) on the evaluation host .36, data parallel: one vLLM server per
-# free GPU (whole model on every GPU), the split's tasks dealt round-robin to one measure_base.py per
+# free GPU (whole model on every GPU), a random (seed 0) 1/n of the split's tasks to one measure_base.py per
 # server, summarize_appworld.py joins the episodes (mean corrected reward, TGC, SGC).
 #
 # Protocol (memory: appworld-2507-code-mode-no-signal, appworld-discovery-mode-official-budget):
@@ -16,7 +16,9 @@
 #
 # usage: appworld_sharded.sh TAG [ADAPTER_DIR]
 #   env: MODE (base|lora), SPLIT (dev), TEMPERATURE (0.0), WORKERS per shard (4), GPU_GROUPS,
-#        PORT_BASE (18300), APPWORLD_PORT_BASE (7300), BASE, MAX_LEN (32768), OUT_ROOT, WORK
+#        PORT_BASE (18300), APPWORLD_PORT_BASE (7300), BASE, MAX_LEN (32768), OUT_ROOT, WORK,
+#        TOOL_PARSER (hermes; qwen3_coder for Qwen3.5), CHAT_TEMPLATE (a template file, optional).
+#        The collector already sends chat_template_kwargs {"enable_thinking": false} on every call.
 set -euo pipefail
 TAG=${1:?usage: $0 TAG [ADAPTER_DIR]}
 ADAPTER=${2:-}
@@ -27,6 +29,9 @@ WORKERS=${WORKERS:-4}
 PORT_BASE=${PORT_BASE:-18300}
 APPWORLD_PORT_BASE=${APPWORLD_PORT_BASE:-7300}
 MAX_LEN=${MAX_LEN:-32768}
+TOOL_PARSER=${TOOL_PARSER:-hermes}
+TEMPLATE_ARGS=()
+[ -n "${CHAT_TEMPLATE:-}" ] && TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE")
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPRO="$(cd "$HERE/.." && pwd)"
 SERVE_VENV=${SERVE_VENV:-/home/yanan/eval36/env/venv-finqa-cu129}
@@ -76,7 +81,7 @@ for i in "${!GPU_SETS[@]}"; do
   CUDA_VISIBLE_DEVICES=${GPU_SETS[$i]} setsid "$SERVE_VENV/bin/python" -m vllm.entrypoints.cli.main serve "$BASE" \
     --served-model-name base --host 127.0.0.1 --port "$port" --tensor-parallel-size 1 \
     --max-model-len "$MAX_LEN" --gpu-memory-utilization "${GPU_UTIL:-0.80}" --dtype half --attention-backend TRITON_ATTN \
-    --enable-auto-tool-choice --tool-call-parser hermes "${SERVE_ARGS[@]}" > "$OUT/server_$i.log" 2>&1 &
+    --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" "${SERVE_ARGS[@]}" > "$OUT/server_$i.log" 2>&1 &
   PIDS+=($!)
 done
 for i in "${!GPU_SETS[@]}"; do
@@ -90,7 +95,8 @@ for i in "${!GPU_SETS[@]}"; do
 done
 echo "[$TAG] appworld $SPLIT mode=$MODE T=$TEMPERATURE $N servers ready (GPUs: $GPU_GROUPS) $(date '+%F %T %Z')"
 
-mapfile -t TASKS < <(tr -s ' \n' '\n' < "$ROOT/data/datasets/$SPLIT.txt" | sed '/^$/d')
+# Random but reproducible 1/n of the tasks per GPU (seed 0), as eval_finqa.py --shard.
+mapfile -t TASKS < <("$SERVE_VENV/bin/python" -c "import random,sys; t=open(sys.argv[1]).read().split(); random.Random(0).shuffle(t); print(chr(10).join(t))" "$ROOT/data/datasets/$SPLIT.txt")
 SHARD_PIDS=()
 for i in "${!GPU_SETS[@]}"; do
   ids=$(for k in "${!TASKS[@]}"; do if [ $((k % N)) -eq "$i" ]; then printf '%s,' "${TASKS[$k]}"; fi; done)
