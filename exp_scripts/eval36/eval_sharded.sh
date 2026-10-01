@@ -21,7 +21,8 @@
 #   env: MODE (base|lora, default base), SAMPLING (greedy|t0k4|t07k4), GPU_GROUPS (default
 #        every GPU with < 256 MiB in use at launch: one GPU per server), PORT_BASE (18100), BASE, TOOL_PARSER,
 #        CHAT_TEMPLATE, CHAT_TEMPLATE_KWARGS, OUT_ROOT (/home/yanan/eval36/results/<bench>),
-#        WORK (/home/yanan/eval36/work)
+#        WORK (/home/yanan/eval36/work), MAX_LEN (override the benchmark's max-model-len),
+#        EVAL36_HOSTS (required: "judge-host=ip", see dns_override/sitecustomize.py)
 set -euo pipefail
 BENCH=${1:?usage: $0 single|multi TAG [ADAPTER_DIR]}
 TAG=${2:?usage: $0 single|multi TAG [ADAPTER_DIR]}
@@ -36,9 +37,9 @@ PY="$VENV/bin/python"
 BASE=${BASE:-/home/yanan/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554}
 WORK=${WORK:-/home/yanan/eval36/work}
 case "$BENCH" in
-  single) SRC="$REPRO/finqa_singletable"; EVAL="$SRC/eval_finqa.py"; SPLITS=(val test); MAX_LEN=12288
+  single) SRC="$REPRO/finqa_singletable"; EVAL="$SRC/eval_finqa.py"; SPLITS=(val test); MAX_LEN=${MAX_LEN:-12288}
           ;;
-  multi)  SRC="$REPRO/finqa_multitable"; EVAL="$SRC/eval_multitable.py"; SPLITS=(multi_val multi_test); MAX_LEN=49152
+  multi)  SRC="$REPRO/finqa_multitable"; EVAL="$SRC/eval_multitable.py"; SPLITS=(multi_val multi_test); MAX_LEN=${MAX_LEN:-49152}
           ;;
   *) echo "first argument must be single or multi" >&2; exit 2 ;;
 esac
@@ -73,6 +74,23 @@ TEMPLATE_ARGS=()
 [ -n "${CHAT_TEMPLATE:-}" ] && TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE")
 KWARGS_ARGS=()
 [ -n "${CHAT_TEMPLATE_KWARGS:-}" ] && KWARGS_ARGS=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
+# .36 cannot reach its DNS server; the judge's host is pinned to the address .29 resolves it to.
+[ -n "${EVAL36_HOSTS:-}" ] || { echo "expected EVAL36_HOSTS=judge-host=ip (resolve it on .29); .36 has no DNS" >&2; exit 2; }
+export EVAL36_HOSTS
+export PYTHONPATH="$HERE/dns_override${PYTHONPATH:+:$PYTHONPATH}"
+# A judge that cannot be reached scores every answer 0 after its retries: refuse to start instead.
+( cd "$REPRO/finqa_singletable" && "$PY" - <<'PY'
+import sys
+sys.path.insert(0, ".")
+from judge_env import load_judge_env
+load_judge_env()
+import finqa_env, finqa_eval
+ok, _ = finqa_eval._call_judge(finqa_eval.CORRECTNESS_PROMPT, "question : What is 2+2?\nmodel response : 4\nlabel : 4", multi_table=False)
+if ok is not True:
+    raise SystemExit("judge preflight: expected True for a trivially correct answer; the judge is unreachable or misconfigured")
+print("[judge preflight] ok")
+PY
+) || exit 2
 mkdir -p "$OUT" "$WORK/$TAG"
 FINQA_VENV=$VENV source "$REPRO/finqa_singletable/vllm_env.sh"
 # .36 has no CUDA toolkit (nvcc): FlashInfer's JIT attention and sampler cannot build there, so the
@@ -120,6 +138,11 @@ for split in "${SPLITS[@]}"; do
     SHARD_PIDS+=($!)
   done
   for pid in "${SHARD_PIDS[@]}"; do wait "$pid" || { echo "[$TAG] a $split shard failed; see $OUT/eval_${split}_*.log" >&2; exit 1; }; done
+  alarms=$(cat "$OUT"/eval_"${split}"_*.log | grep -c "finqa-judge\] ALARM" || true)
+  if [ "$alarms" -gt 0 ]; then
+    echo "[$TAG] $split: $alarms answers were scored 0 because the judge never answered; the result is invalid" >&2
+    exit 1
+  fi
   shard_dirs=()
   for i in "${!GPU_SETS[@]}"; do shard_dirs+=("$WORK/$TAG/$split/shard_$i"); done
   "$PY" "$REPRO/finqa_multitable/merge_eval_shards.py" "$WORK/$TAG/$split/merged" "${shard_dirs[@]}" | tee "$OUT/merge_$split.log"
