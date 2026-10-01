@@ -124,6 +124,9 @@ training:
     rollout-health-check-timeout: "1200"
     # Rolling window of ~15 bundles; see note 6 in the header.
     reef-checkpoint-max-storage: "400GB"
+    # LoRA adapter only per step (2026-10-01): no Megatron actor/critic checkpoint (~16.6 GB/step, ~350 GB
+    # rolling per run). Evaluation reads the adapter; the run cannot resume in place (we never do).
+    reef-checkpoint-adapter-only: true
     attention-dropout: "0.0"
     hidden-dropout: "0.0"
     attention-softmax-in-fp32: true
