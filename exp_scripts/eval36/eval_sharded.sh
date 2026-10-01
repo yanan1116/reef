@@ -8,6 +8,7 @@
 # parallel: every GPU holds the whole model and serves 1/n of the tasks. Host-forced differences,
 # stated in every result's protocol.json; base and checkpoints are compared within .36 only:
 #   --dtype half     .36's Quadro RTX 5000 (Turing, sm_75) has no bf16; every other host serves bf16
+#   TRITON_ATTN      no nvcc on .36, so FlashInfer (JIT) is unavailable; sampler is torch's
 #   vllm 0.22.1+cu129 .36's driver 535 (CUDA 12.2) cannot run the PyPI CUDA-13 build of the same
 #                    version (its kernels silently write zeros); the venv is .29's .venv-finqa with
 #                    only vllm swapped (FINQA_VENV=/home/yanan/eval36/env/venv-finqa-cu129)
@@ -17,7 +18,7 @@
 #
 # usage: eval_sharded.sh single|multi TAG [ADAPTER_DIR]
 #   env: MODE (base|lora, default base), SAMPLING (greedy|t0k4|t07k4), GPU_GROUPS (default
-#        "0 1 2 3 4 5 6 7": one GPU per server), PORT_BASE (18100), BASE, TOOL_PARSER,
+#        every GPU with < 256 MiB in use at launch: one GPU per server), PORT_BASE (18100), BASE, TOOL_PARSER,
 #        CHAT_TEMPLATE, CHAT_TEMPLATE_KWARGS, OUT_ROOT (/home/yanan/eval36/results/<bench>),
 #        WORK (/home/yanan/eval36/work)
 set -euo pipefail
@@ -35,9 +36,9 @@ BASE=${BASE:-/home/yanan/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-
 WORK=${WORK:-/home/yanan/eval36/work}
 case "$BENCH" in
   single) SRC="$REPRO/finqa_singletable"; EVAL="$SRC/eval_finqa.py"; SPLITS=(val test); MAX_LEN=12288
-          GPU_GROUPS=${GPU_GROUPS:-"0 1 2 3 4 5 6 7"} ;;
+          ;;
   multi)  SRC="$REPRO/finqa_multitable"; EVAL="$SRC/eval_multitable.py"; SPLITS=(multi_val multi_test); MAX_LEN=49152
-          GPU_GROUPS=${GPU_GROUPS:-"0 1 2 3 4 5 6 7"} ;;
+          ;;
   *) echo "first argument must be single or multi" >&2; exit 2 ;;
 esac
 OUT_ROOT=${OUT_ROOT:-/home/yanan/eval36/results/$BENCH}
@@ -49,8 +50,11 @@ case "$SAMPLING" in
   t07k4)  SAMPLING_ARGS=(--temperature 0.7 --top-p 1.0 --seed none --attempts 4) ;;
   *) echo "SAMPLING must be greedy, t0k4 or t07k4" >&2; exit 2 ;;
 esac
+# .36 is shared: take every GPU nobody else is using (other users' jobs come and go).
+GPU_GROUPS=${GPU_GROUPS:-$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F', ' '$2 < 256 {printf "%s ", $1}')}
 read -r -a GPU_SETS <<< "$GPU_GROUPS"  # (GROUPS is a bash special variable)
 N=${#GPU_SETS[@]}
+[ "$N" -gt 0 ] || { echo "expected at least one free GPU on $(hostname); all are in use" >&2; exit 2; }
 [ -x "$PY" ] || { echo "expected $PY (is the read-only mount of .29:/home/yanan/agents up?)" >&2; exit 2; }
 test -f "$BASE/config.json" || { echo "base model not found: $BASE" >&2; exit 2; }
 [ -e "$OUT" ] && { echo "$OUT exists; refusing to overwrite" >&2; exit 2; }
@@ -70,6 +74,9 @@ KWARGS_ARGS=()
 [ -n "${CHAT_TEMPLATE_KWARGS:-}" ] && KWARGS_ARGS=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
 mkdir -p "$OUT" "$WORK/$TAG"
 FINQA_VENV=$VENV source "$REPRO/finqa_singletable/vllm_env.sh"
+# .36 has no CUDA toolkit (nvcc): FlashInfer's JIT attention and sampler cannot build there, so the
+# Triton attention backend (its own compiler) and the torch sampler serve instead.
+export VLLM_USE_FLASHINFER_SAMPLER=0
 
 PIDS=()
 cleanup() {
@@ -86,6 +93,7 @@ for i in "${!GPU_SETS[@]}"; do
   # python -m, not bin/vllm: the venv was copied to .36, so its console scripts point at .29's venv.
   CUDA_VISIBLE_DEVICES=$gpus setsid "$PY" -m vllm.entrypoints.cli.main serve "$BASE" --served-model-name base --host 127.0.0.1 --port "$port" \
     --tensor-parallel-size "$tp" --max-model-len "$MAX_LEN" --gpu-memory-utilization 0.85 --dtype half \
+    --attention-backend TRITON_ATTN \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" "${SERVE_ARGS[@]}" \
     > "$OUT/server_$i.log" 2>&1 &
   PIDS+=($!)
@@ -117,7 +125,7 @@ for split in "${SPLITS[@]}"; do
   GPU_GROUPS_USED="$GPU_GROUPS" "$PY" - "$WORK/$TAG/$split/merged/protocol.json" "$OUT/${split}_protocol.json" <<'PY'
 import json, sys
 protocol = json.load(open(sys.argv[1]))
-protocol.update(host=".36 Quadro RTX 5000 (sm_75)", dtype="float16", vllm="0.22.1+cu129",
+protocol.update(host=".36 Quadro RTX 5000 (sm_75)", dtype="float16", vllm="0.22.1+cu129", attention_backend="TRITON_ATTN",
                 gpu_groups=__import__("os").environ.get("GPU_GROUPS_USED"))
 json.dump(protocol, open(sys.argv[2], "w"), indent=2)
 PY
