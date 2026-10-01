@@ -22,7 +22,8 @@
 #        every GPU with < 256 MiB in use at launch: one GPU per server), PORT_BASE (18100), BASE, TOOL_PARSER,
 #        CHAT_TEMPLATE, CHAT_TEMPLATE_KWARGS, OUT_ROOT (/home/yanan/eval36/results/<bench>),
 #        WORK (/home/yanan/eval36/work), MAX_LEN (override the benchmark's max-model-len),
-#        EVAL36_HOSTS (required: "judge-host=ip", see dns_override/sitecustomize.py)
+#        EVAL36_HOSTS (required: "judge-host=ip", see dns_override/sitecustomize.py),
+#        EVAL_SPLITS (override the benchmark's splits, e.g. "val" or "multi_val")
 set -euo pipefail
 BENCH=${1:?usage: $0 single|multi TAG [ADAPTER_DIR]}
 TAG=${2:?usage: $0 single|multi TAG [ADAPTER_DIR]}
@@ -54,6 +55,7 @@ case "$SAMPLING" in
 esac
 # .36 is shared: take every GPU nobody else is using (other users' jobs come and go).
 GPU_GROUPS=${GPU_GROUPS:-$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F', ' '$2 < 256 {printf "%s ", $1}')}
+if [ -n "${EVAL_SPLITS:-}" ]; then read -r -a SPLITS <<< "$EVAL_SPLITS"; fi
 read -r -a GPU_SETS <<< "$GPU_GROUPS"  # (GROUPS is a bash special variable)
 N=${#GPU_SETS[@]}
 [ "$N" -gt 0 ] || { echo "expected at least one free GPU on $(hostname); all are in use" >&2; exit 2; }
@@ -126,7 +128,29 @@ for i in "${!GPU_SETS[@]}"; do
   done
   curl -fsS "http://127.0.0.1:$port/v1/models" >/dev/null
 done
-echo "[$TAG] $BENCH mode=$MODE sampling=$SAMPLING $N servers ready (groups: $GPU_GROUPS) $(date '+%F %T %Z')"
+echo "[$TAG] $BENCH mode=$MODE sampling=$SAMPLING splits=${SPLITS[*]} $N servers ready (groups: $GPU_GROUPS) $(date '+%F %T %Z')"
+if [ "$MODE" = lora ]; then
+  # The adapter must change the policy (as eval_*_checkpoint.sh checks): greedy log-probs of one prompt
+  # must differ between the base and the adapter on every server.
+  for i in "${!GPU_SETS[@]}"; do
+    "$PY" - "$((PORT_BASE + i))" <<'PY'
+import json, sys, urllib.request
+port = sys.argv[1]
+def logprobs(model):
+    body = dict(model=model, messages=[{"role": "user", "content": "What was 3M's total revenue in 2023?"}],
+                temperature=0, max_tokens=48, logprobs=True, top_logprobs=1, seed=1234)
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(),
+                                     {"Content-Type": "application/json"})
+    return [t["logprob"] for t in json.load(urllib.request.urlopen(request, timeout=300))["choices"][0]["logprobs"]["content"]]
+base, ckpt = logprobs("base"), logprobs("ckpt")
+n = min(len(base), len(ckpt))
+difference = max(abs(x - y) for x, y in zip(base[:n], ckpt[:n]))
+print(f"[adapter-check] port {port}: max |logprob(base) - logprob(ckpt)| over {n} tokens = {difference:.4g}")
+if difference == 0:
+    raise SystemExit("the adapter request returned the base's log-probs: the adapter is not applied")
+PY
+  done
+fi
 
 for split in "${SPLITS[@]}"; do
   SHARD_PIDS=()
