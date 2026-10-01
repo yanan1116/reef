@@ -115,6 +115,11 @@ def prepare_checkpoint_storage(args: SlimeArguments, retention: RetentionConfig)
     ``--critic-save`` gets ``<save>-critic`` so the critic's weights and
     optimizer survive restarts instead of cold-starting the value head.
     """
+    if retention.adapter_only and not args.megatron_lora_rank:
+        raise RuntimeError(
+            "--reef-checkpoint-adapter-only keeps only the LoRA adapter of each step, but this run trains full "
+            "weights (no --megatron-lora-rank); drop the flag or train LoRA"
+        )
     critic_root = (args.critic_save or f"{args.save}-critic") if args.use_critic else None
     storage = CheckpointStorage(
         retention,
@@ -127,6 +132,12 @@ def prepare_checkpoint_storage(args: SlimeArguments, retention: RetentionConfig)
         critic_save_interval=args.critic_save_interval,
     )
     marker = read_marker(storage.marker_path)
+    if retention.adapter_only and marker is not None:
+        raise RuntimeError(
+            f"checkpoint directory {storage.root} already holds training job {marker['job_id']}, but "
+            "--reef-checkpoint-adapter-only writes no Megatron checkpoint to resume from; start with a fresh "
+            "checkpoint directory or drop the flag"
+        )
     if marker is not None and marker["status"] == "RUNNING":
         raise RuntimeError(f"ambiguous training job {marker['job_id']}")
     if marker is not None and marker["status"] in {"REJECTING", "REJECTED"}:
@@ -141,6 +152,8 @@ def prepare_checkpoint_storage(args: SlimeArguments, retention: RetentionConfig)
         reasons = "; ".join(storage_plan["reasons"])
         raise RuntimeError(f"checkpoint storage preflight blocked bridge startup: {reasons}")
     args.save_hf, args.save = storage.hf_template, str(storage.megatron_root)
+    # Read by the Megatron workers (actor and critic), which skip the Megatron save.
+    args.reef_checkpoint_adapter_only = retention.adapter_only
     if storage.critic_root is not None:
         args.critic_save = str(storage.critic_root)
     return storage

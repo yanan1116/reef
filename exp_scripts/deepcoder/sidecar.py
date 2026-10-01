@@ -13,6 +13,8 @@
      - every ADAPTER_EVERY-th step's LoRA adapter (127 MB) -> KEEP/adapters/hf_rollout_NNNNN
      - every FULL_EVERY-th step's full bundle (16.3 GB)   -> KEEP/full/step_NNN/{hf,actor,critic}
      - FINAL_STEP (if set) gets both, so the last step is kept off-cadence
+   SIDECAR_FULL_EVERY=0 keeps adapters only: with the backend's adapter-only
+   checkpoints (--reef-checkpoint-adapter-only) there is no Megatron state to copy.
    KEEP is outside the managed tree (inside it, the checkpoint preflight rejects
    unowned assets and refuses to start). Checkpoint files are root-owned and
    not world-readable, so discovery happens on the host but the copy runs as
@@ -41,7 +43,7 @@ PROGRESS_FILE = Path(os.environ["SAO_PROGRESS_FILE"])
 HF_DIR = Path(os.environ["SIDECAR_HF_DIR"])            # <state>/checkpoints/hf
 KEEP_DIR = Path(os.environ["SIDECAR_KEEP_DIR"])        # outside the checkpoint tree (host path)
 CONTAINER = os.environ.get("SIDECAR_CONTAINER", "reef-sao-stack")
-FULL_EVERY = int(os.environ.get("SIDECAR_FULL_EVERY", "10"))
+FULL_EVERY = int(os.environ.get("SIDECAR_FULL_EVERY", "10"))   # 0 = never (adapter-only checkpoints)
 ADAPTER_EVERY = int(os.environ.get("SIDECAR_ADAPTER_EVERY", "1"))   # 1 = every step
 FINAL_STEP = int(os.environ.get("SIDECAR_FINAL_STEP", "0"))          # also keep this step (0 = none)
 C_CKPT = "/var/lib/reef/checkpoints"                    # the same trees, as the container sees them
@@ -114,7 +116,7 @@ def mirror_checkpoints(kept_adapters: set[int], kept_full: set[int]) -> None:
                     log(f"kept adapter step={rid + 1} (rollout_id {rid}) -> {KEEP_DIR}/adapters/hf_rollout_{rid:05d}")
                 else:
                     log(f"adapter copy step={rid + 1} failed, will retry: {err}")
-        if (step % FULL_EVERY == 0 or keep_step) and rid not in kept_full:
+        if FULL_EVERY > 0 and (step % FULL_EVERY == 0 or keep_step) and rid not in kept_full:
             # The Megatron states are complete once both trackers reached this iteration.
             if _latest_iteration(megatron_root) < rid or _latest_iteration(critic_root) < rid:
                 continue

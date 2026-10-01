@@ -34,6 +34,7 @@ class SlimeArguments(Namespace):
     critic_save: str | None
     critic_init: str | None
     critic_save_interval: int
+    reef_checkpoint_adapter_only: bool = False
     critic_steps_per_actor: int | None
     num_critic_only_steps: int
     critic_lr: float | None
