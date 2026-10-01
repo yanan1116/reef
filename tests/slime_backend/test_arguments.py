@@ -197,3 +197,50 @@ def test_checkpoint_preflight_preserves_invalid_interval_for_validation(tmp_path
     with pytest.raises(ValueError, match="critic_save_interval"):
         prepare_checkpoint_storage(args, RetentionConfig())
     assert not (tmp_path / "megatron").exists()
+
+
+@pytest.mark.unit
+def test_adapter_only_checkpoints_need_lora_and_a_fresh_directory(tmp_path) -> None:
+    from reef.runtime.recovery import write_marker
+    from reef.train.slime_backend.reef_adapters.preflight import prepare_checkpoint_storage
+    from reef.train.slime_backend.reef_adapters.training_job.storage import RetentionConfig
+
+    source = tmp_path / "source-hf"
+    source.mkdir()
+    (source / "model.safetensors").write_bytes(b"x" * 100)
+
+    def args(rank: int) -> SlimeArguments:
+        return SlimeArguments(
+            save_hf=str(tmp_path / "ckpt" / "hf" / "{rollout_id}"),
+            save=str(tmp_path / "ckpt" / "megatron"),
+            use_critic=True,
+            critic_save=None,
+            hf_checkpoint=str(source),
+            load=None,
+            megatron_lora_rank=rank,
+            critic_save_interval=1,
+        )
+
+    retention = RetentionConfig(adapter_only=True, max_storage_bytes=10**9, min_free_space_bytes=0)
+    with pytest.raises(RuntimeError, match="trains full weights"):
+        prepare_checkpoint_storage(args(0), retention)
+
+    fresh = args(32)
+    storage = prepare_checkpoint_storage(fresh, retention)
+    assert fresh.reef_checkpoint_adapter_only is True
+    assert storage.required_assets(3) == (tmp_path / "ckpt" / "hf" / "3",)
+
+    (tmp_path / "ckpt" / "hf" / "0").mkdir(parents=True)
+    write_marker(
+        storage.marker_path,
+        {
+            "job_id": "job-0",
+            "status": "COMPLETE",
+            "rollout_id": 0,
+            "runtime_load_id": "incarnation:1",
+            "scenario_step": 0,
+            "checkpoint_path": str(tmp_path / "ckpt" / "hf" / "0"),
+        },
+    )
+    with pytest.raises(RuntimeError, match="writes no Megatron checkpoint to resume from"):
+        prepare_checkpoint_storage(args(32), retention)

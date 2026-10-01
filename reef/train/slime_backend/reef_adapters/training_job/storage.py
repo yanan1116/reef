@@ -42,6 +42,10 @@ class RetentionConfig:
     min_free_space_fraction: float = 0.1
     max_storage_bytes: int | None = None
     min_free_space_bytes: int | None = None
+    # Keep only the HF LoRA adapter of each step: no Megatron actor or critic
+    # checkpoint is written or required. Serving and evaluation read only the
+    # adapter; the price is that the run cannot resume in place.
+    adapter_only: bool = False
 
     def __post_init__(self) -> None:
         if self.policy not in POLICIES:
@@ -419,14 +423,17 @@ class CheckpointStorage:
                 continue
         return rollouts
 
-    def pair_paths(self, rollout_id: int) -> tuple[Path, Path]:
+    def pair_paths(self, rollout_id: int) -> tuple[Path, ...]:
         """The recovery pair: the HF export and the actor Megatron checkpoint.
 
-        These two always exist for a COMPLETE record (the recovery-pair
+        These always exist for a COMPLETE record (the recovery-pair
         invariant); the critic asset is additional and tracked by
-        :meth:`asset_paths`.
+        :meth:`asset_paths`. With ``adapter_only`` the HF adapter is the
+        whole record: no Megatron checkpoint is written.
         """
         hf = Path(self.hf_template.format(rollout_id=rollout_id))
+        if self.config.adapter_only:
+            return (hf,)
         return hf, self.megatron_root / f"iter_{rollout_id:07d}"
 
     def asset_paths(self, rollout_id: int) -> tuple[Path, ...]:
@@ -439,7 +446,7 @@ class CheckpointStorage:
         critic checkpoint degrades to a value-model cold start, not a blocked
         store."""
         paths: tuple[Path, ...] = self.pair_paths(rollout_id)
-        if self.critic_root is not None:
+        if self.critic_root is not None and not self.config.adapter_only:
             paths = (*paths, self.critic_root / f"iter_{rollout_id:07d}")
         return paths
 
@@ -451,7 +458,11 @@ class CheckpointStorage:
         checkpoint from a denser earlier cadence is still recognized and
         retired with its rollout."""
         paths: tuple[Path, ...] = self.pair_paths(rollout_id)
-        if self.critic_root is not None and critic_checkpoint_due(rollout_id, self.critic_save_interval):
+        if (
+            self.critic_root is not None
+            and not self.config.adapter_only
+            and critic_checkpoint_due(rollout_id, self.critic_save_interval)
+        ):
             paths = (*paths, self.critic_root / f"iter_{rollout_id:07d}")
         return paths
 
