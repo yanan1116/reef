@@ -86,6 +86,8 @@ def main() -> None:
     parser.add_argument("--seed", default="1234")
     parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=32)
+    parser.add_argument("--shard", default="0/1",
+                        help="i/n: evaluate the tasks at positions k with k %% n == i (one GPU of n); merge with merge_eval_shards.py")
     parser.add_argument("--chat-template-kwargs", default=None)
     args = parser.parse_args()
     template_kwargs = json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else None
@@ -96,13 +98,17 @@ def main() -> None:
     rows = [json.loads(line) for line in open(tasks_path) if line.strip()]
     if len(rows) != EXPECTED_TASKS[args.split]:
         raise SystemExit(f"{tasks_path}: {len(rows)} tasks, expected {EXPECTED_TASKS[args.split]}")
+    shard_index, shard_count = (int(part) for part in args.shard.split("/"))
+    if not 0 <= shard_index < shard_count:
+        parser.error(f"--shard {args.shard}: expected i/n with 0 <= i < n")
+    rows = [row for position, row in enumerate(rows) if position % shard_count == shard_index]
     sampling: dict = {"temperature": args.temperature, "top_p": args.top_p}
     if args.seed != "none":
         sampling["seed"] = int(args.seed)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
     protocol = {
-        "model": args.model, "split": args.split, "tasks": len(rows), "attempts": args.attempts, "sampling": sampling,
+        "model": args.model, "split": args.split, "tasks": len(rows), "shard": args.shard, "attempts": args.attempts, "sampling": sampling,
         "max_tokens": {"tool_use": flow.DISCOVERY_MAX_COMPLETION_TOKENS, "final": flow.FINAL_MAX_COMPLETION_TOKENS},
         "call_timeout_s": flow.LLM_TIMEOUT_SECONDS, "concurrency": args.concurrency,
         "judge_model": os.environ["FINQA_MULTI_TABLE_JUDGE_MODEL"], "protocol_version": flow.PROTOCOL_VERSION,
