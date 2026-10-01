@@ -273,11 +273,13 @@ class ReefMegatronTrainRayActor(MegatronTrainRayActor):
 
                 maybe_finalize_async_save(blocking=True)
 
-            from slime.backends.megatron_utils.model import save
+            # Set by the checkpoint preflight; absent on a namespace that never went through it.
+            if not getattr(self.args, "reef_checkpoint_adapter_only", False):
+                from slime.backends.megatron_utils.model import save
 
-            save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
-            if force_sync and self.args.async_save:
-                maybe_finalize_async_save(blocking=True)
+                save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+                if force_sync and self.args.async_save:
+                    maybe_finalize_async_save(blocking=True)
 
             slots = self.adapter_slots
             if self.args.save_hf is not None and self.role == "actor":

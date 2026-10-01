@@ -40,6 +40,7 @@ def _storage(
     lora: bool = False,
     critic: bool = False,
     critic_save_interval: int = 1,
+    adapter_only: bool = False,
 ) -> CheckpointStorage:
     root = tmp_path / "checkpoints"
     source_hf, source_megatron = tmp_path / "source-hf", tmp_path / "source-megatron"
@@ -47,7 +48,9 @@ def _storage(
     _write_bytes(source_megatron / "iter_0000000", 90)
     (source_megatron / "latest_checkpointed_iteration.txt").write_text("0", encoding="utf-8")
     return CheckpointStorage(
-        RetentionConfig(policy=policy, max_storage_bytes=cap, min_free_space_bytes=min_free),
+        RetentionConfig(
+            policy=policy, max_storage_bytes=cap, min_free_space_bytes=min_free, adapter_only=adapter_only
+        ),
         hf_template=str(root / "hf" / "{rollout_id}"),
         megatron_root=root / "megatron",
         source_hf=source_hf,
@@ -102,6 +105,25 @@ def test_complete_requires_the_critic_asset_only_on_its_save_commits(tmp_path: P
         storage.complete("job-1", 1, reward=1.0)
 
     assert storage.required_assets(1) == (*storage.pair_paths(1), critic_root / "iter_0000001")
+
+
+@pytest.mark.unit
+def test_adapter_only_records_and_retires_the_hf_adapter_alone(tmp_path: Path) -> None:
+    # Adapter-only runs write no Megatron actor or critic checkpoint: a commit
+    # completes with the HF adapter alone, and retention retires adapters only.
+    storage = _storage(tmp_path, cap=500, critic=True, lora=True, adapter_only=True)
+    hf = Path(storage.hf_template.format(rollout_id=0))
+    assert storage.pair_paths(0) == storage.asset_paths(0) == storage.required_assets(0) == (hf,)
+
+    for rollout_id in range(6):
+        with storage.admit(rollout_id=rollout_id) as plan:
+            assert not plan["blocked"], plan
+            _write_bytes(Path(storage.hf_template.format(rollout_id=rollout_id)), 100)
+            storage.complete(f"job-{rollout_id}", rollout_id, reward=None)
+
+    assert not (storage.megatron_root / "iter_0000005").exists()
+    kept = sorted(int(path.name) for path in storage.hf_root.iterdir() if path.name.isdigit())
+    assert kept[-1] == 5 and len(kept) < 6
 
 
 @pytest.mark.unit
