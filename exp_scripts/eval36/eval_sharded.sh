@@ -23,7 +23,11 @@
 #        CHAT_TEMPLATE, CHAT_TEMPLATE_KWARGS, OUT_ROOT (/home/yanan/eval36/results/<bench>),
 #        WORK (/home/yanan/eval36/work), MAX_LEN (override the benchmark's max-model-len),
 #        EVAL36_HOSTS (required: "judge-host=ip", see dns_override/sitecustomize.py),
-#        EVAL_SPLITS (override the benchmark's splits, e.g. "val" or "multi_val")
+#        EVAL_SPLITS (override the benchmark's splits, e.g. "val" or "multi_val"),
+#        CONCURRENCY (episodes in flight per server, default 32 as on .29). On .36 keep it at what one
+#        16 GB card's KV cache runs at once (multi-table ~4-5, single-table ~10): queued requests wait
+#        past the protocol's 300 s call timeout and the episode ends unanswered (2026-10-01: 108 of 126
+#        multi_val episodes at 32). A split with > 1% model-call failures is refused as invalid.
 set -euo pipefail
 BENCH=${1:?usage: $0 single|multi TAG [ADAPTER_DIR]}
 TAG=${2:?usage: $0 single|multi TAG [ADAPTER_DIR]}
@@ -157,7 +161,8 @@ for split in "${SPLITS[@]}"; do
   for i in "${!GPU_SETS[@]}"; do
     FINQA_JUDGE_FINISH_LOG="$OUT/judge_finish_${split}_$i.tsv" FINQA_MULTI_TABLE_JUDGE_MODEL=gpt-5.4-nano "$PY" -u "$EVAL" \
       --base-url "http://127.0.0.1:$((PORT_BASE + i))/v1" --model "$MODEL_NAME" --split "$split" \
-      --output "$WORK/$TAG/$split/shard_$i" --shard "$i/$N" "${SAMPLING_ARGS[@]}" "${KWARGS_ARGS[@]}" \
+      --output "$WORK/$TAG/$split/shard_$i" --shard "$i/$N" --concurrency "${CONCURRENCY:-32}" \
+      "${SAMPLING_ARGS[@]}" "${KWARGS_ARGS[@]}" \
       > "$OUT/eval_${split}_$i.log" 2>&1 &
     SHARD_PIDS+=($!)
   done
@@ -170,6 +175,16 @@ for split in "${SPLITS[@]}"; do
   shard_dirs=()
   for i in "${!GPU_SETS[@]}"; do shard_dirs+=("$WORK/$TAG/$split/shard_$i"); done
   "$PY" "$REPRO/finqa_multitable/merge_eval_shards.py" "$WORK/$TAG/$split/merged" "${shard_dirs[@]}" | tee "$OUT/merge_$split.log"
+  # Model-call failures (timeouts, rejections) end an episode unanswered: refuse a split with > 1% of them.
+  "$PY" - "$WORK/$TAG/$split/merged/result.json" <<'PY' || exit 1
+import json, sys
+d = json.load(open(sys.argv[1]))
+failed = sum(1 for i in d["items"] if i.get("error") or i.get("llm_errors") or i.get("ended") == "tool_phase_llm_error")
+print(f"[call failures] {failed}/{d['total']} episodes")
+if failed > 0.01 * d["total"]:
+    raise SystemExit(f"{failed}/{d['total']} episodes had model-call failures (> 1%); the result is invalid "
+                     "(lower CONCURRENCY to what one server's KV cache runs at once)")
+PY
   GPU_GROUPS_USED="$GPU_GROUPS" "$PY" - "$WORK/$TAG/$split/merged/protocol.json" "$OUT/${split}_protocol.json" <<'PY'
 import json, sys
 protocol = json.load(open(sys.argv[1]))
