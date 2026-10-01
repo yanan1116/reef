@@ -123,13 +123,13 @@ def worker(index: int, tasks: list[str], args: argparse.Namespace) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         turns.clear()
-        server = c.Server(args.port_base + index, TAIL / "appworld", TAIL / "appworld" / ".venv",
+        server = c.Server(args.port_base + index, Path(args.appworld_root), TAIL / "appworld" / ".venv",
                           out / "servers" / f"server-{index}.log")
         try:
             server.start()
             row = c.run_task(server, task_id, records.get(task_id, {}), args.temperature,
                              f"sao-measure/{Path(args.out).name}/{task_id}/r{rnd:02d}",
-                             TAIL / "appworld", args.modality, True)
+                             Path(args.appworld_root), args.modality, True)
             last = turns[-1] if turns else {}
             row.update({
                 "turns": list(turns),
@@ -167,6 +167,9 @@ def main() -> None:
     parser.add_argument("--episode-token-wall", type=int, default=None,
                         help="cap the whole episode's generated tokens, as the harness's max_completion_length")
     parser.add_argument("--rounds", type=int, default=1, help="independent episodes per task")
+    parser.add_argument("--appworld-root", default=str(TAIL / "appworld"),
+                        help="writable AppWorld root (data/ + experiments outputs); local disk, not NFS. "
+                             "The server binary stays in the shared checkout's .venv")
     parser.add_argument("--auto-print-last-expr", action="store_true",
                         help="variant: print a trailing bare expression's value (REPL display)")
     args = parser.parse_args()
