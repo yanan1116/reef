@@ -24,6 +24,7 @@
 #        WORK (/home/yanan/eval36/work), MAX_LEN (override the benchmark's max-model-len),
 #        EVAL36_HOSTS (required: "judge-host=ip", see dns_override/sitecustomize.py),
 #        EVAL_SPLITS (override the benchmark's splits, e.g. "val" or "multi_val"),
+#        CHUNKS (random parts per split for the dynamic queue; 130 single-table, 63 multi-table),
 #        CONCURRENCY (episodes in flight per server, default 32 as on .29). On .36 keep it at what one
 #        16 GB card's KV cache runs at once (multi-table ~4-5, single-table ~10): queued requests wait
 #        past the protocol's 300 s call timeout and the episode ends unanswered (2026-10-01: 108 of 126
@@ -159,24 +160,56 @@ PY
   done
 fi
 
-for split in "${SPLITS[@]}"; do
-  SHARD_PIDS=()
-  for i in "${!GPU_SETS[@]}"; do
-    FINQA_JUDGE_FINISH_LOG="$OUT/judge_finish_${split}_$i.tsv" FINQA_MULTI_TABLE_JUDGE_MODEL=gpt-5.4-nano "$PY" -u "$EVAL" \
+# Dynamic task assignment. Each split is dealt into CHUNKS small random parts (eval_*.py --shard k/CHUNKS,
+# ~4 single-table / ~2 multi-table tasks each); every server runs CONCURRENCY workers, and each worker
+# takes the next part from one queue (all splits) and runs it one episode at a time (--concurrency 1). A
+# server so keeps CONCURRENCY episodes in flight until the queue is empty, as the static 1/N shards did,
+# but one long episode no longer holds back a GPU's whole share, and no GPU waits for the others between
+# splits. The evaluation itself (eval_finqa.py / eval_multitable.py) is unchanged; merge_eval_shards.py
+# checks that the parts cover every split exactly once.
+CONCURRENCY=${CONCURRENCY:-32}
+if [ "$BENCH" = single ]; then CHUNKS=${CHUNKS:-130}; else CHUNKS=${CHUNKS:-63}; fi
+QUEUE="$WORK/$TAG/queue.txt"; NEXT="$WORK/$TAG/queue.next"; FAILED="$WORK/$TAG/FAILED"
+for split in "${SPLITS[@]}"; do for ((k=0; k<CHUNKS; k++)); do echo "$split $k"; done; done > "$QUEUE"
+echo 0 > "$NEXT"
+next_part() {  # prints "split k" of the next part, or fails when the queue is empty
+  (
+    flock 9
+    local n line
+    n=$(cat "$NEXT")
+    line=$(sed -n "$((n + 1))p" "$QUEUE")
+    [ -n "$line" ] || exit 1
+    echo $((n + 1)) > "$NEXT"
+    echo "$line"
+  ) 9<> "$QUEUE.lock"
+}
+worker() {  # server index
+  local i=$1 part split k
+  while [ ! -e "$FAILED" ] && part=$(next_part); do
+    read -r split k <<< "$part"
+    FINQA_JUDGE_FINISH_LOG="$OUT/judge_finish_${split}_$k.tsv" FINQA_MULTI_TABLE_JUDGE_MODEL=gpt-5.4-nano "$PY" -u "$EVAL" \
       --base-url "http://127.0.0.1:$((PORT_BASE + i))/v1" --model "$MODEL_NAME" --split "$split" \
-      --output "$WORK/$TAG/$split/shard_$i" --shard "$i/$N" --concurrency "${CONCURRENCY:-32}" \
+      --output "$WORK/$TAG/$split/shard_$k" --shard "$k/$CHUNKS" --concurrency 1 \
       "${SAMPLING_ARGS[@]}" "${KWARGS_ARGS[@]}" \
-      > "$OUT/eval_${split}_$i.log" 2>&1 &
-    SHARD_PIDS+=($!)
+      > "$OUT/eval_${split}_$k.log" 2>&1 || { echo "$split $k (server $i)" >> "$FAILED"; return 1; }
   done
-  for pid in "${SHARD_PIDS[@]}"; do wait "$pid" || { echo "[$TAG] a $split shard failed; see $OUT/eval_${split}_*.log" >&2; exit 1; }; done
+}
+WORKER_PIDS=()
+for i in "${!GPU_SETS[@]}"; do
+  for ((w=0; w<CONCURRENCY; w++)); do worker "$i" & WORKER_PIDS+=($!); done
+done
+for pid in "${WORKER_PIDS[@]}"; do wait "$pid" || true; done
+if [ -e "$FAILED" ]; then echo "[$TAG] evaluation parts failed: $(tr '\n' ';' < "$FAILED") see $OUT/eval_*.log" >&2; exit 1; fi
+echo "[$TAG] all $(wc -l < "$QUEUE") parts evaluated $(date '+%F %T %Z')"
+
+for split in "${SPLITS[@]}"; do
   alarms=$(cat "$OUT"/eval_"${split}"_*.log | grep -c "finqa-judge\] ALARM" || true)
   if [ "$alarms" -gt 0 ]; then
     echo "[$TAG] $split: $alarms answers were scored 0 because the judge never answered; the result is invalid" >&2
     exit 1
   fi
   shard_dirs=()
-  for i in "${!GPU_SETS[@]}"; do shard_dirs+=("$WORK/$TAG/$split/shard_$i"); done
+  for ((k=0; k<CHUNKS; k++)); do shard_dirs+=("$WORK/$TAG/$split/shard_$k"); done
   "$PY" "$REPRO/finqa_multitable/merge_eval_shards.py" "$WORK/$TAG/$split/merged" "${shard_dirs[@]}" | tee "$OUT/merge_$split.log"
   # Model-call failures (timeouts, rejections) end an episode unanswered: refuse a split with > 1% of them.
   "$PY" - "$WORK/$TAG/$split/merged/result.json" <<'PY' || exit 1
@@ -188,12 +221,16 @@ if failed > 0.01 * d["total"]:
     raise SystemExit(f"{failed}/{d['total']} episodes had model-call failures (> 1%); the result is invalid "
                      "(lower CONCURRENCY to what one server's KV cache runs at once)")
 PY
-  GPU_GROUPS_USED="$GPU_GROUPS" "$PY" - "$WORK/$TAG/$split/merged/protocol.json" "$OUT/${split}_protocol.json" <<'PY'
+  GPU_GROUPS_USED="$GPU_GROUPS" CHUNKS=$CHUNKS CONCURRENCY=$CONCURRENCY "$PY" - "$WORK/$TAG/$split/merged/protocol.json" "$OUT/${split}_protocol.json" <<'PY'
 import json, sys
 protocol = json.load(open(sys.argv[1]))
 protocol.update(host=".36 Quadro RTX 5000 (sm_75)", dtype="float16", vllm="0.22.1+cu129", attention_backend="TRITON_ATTN",
                 gpu_memory_utilization=float(__import__("os").environ.get("GPU_UTIL", "0.80")),
-                gpu_groups=__import__("os").environ.get("GPU_GROUPS_USED"))
+                gpu_groups=__import__("os").environ.get("GPU_GROUPS_USED"),
+                extra_serve_args=__import__("os").environ.get("EXTRA_SERVE_ARGS", ""),
+                scheduler=f"dynamic: {__import__('os').environ['CHUNKS']} random parts per split, "
+                          f"{__import__('os').environ['CONCURRENCY']} one-episode workers per server",
+                concurrency=int(__import__("os").environ["CONCURRENCY"]))
 json.dump(protocol, open(sys.argv[2], "w"), indent=2)
 PY
   cp "$WORK/$TAG/$split/merged/result.json" "$OUT/$split.json"
