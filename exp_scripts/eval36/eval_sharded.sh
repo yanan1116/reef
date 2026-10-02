@@ -29,6 +29,9 @@
 #        past the protocol's 300 s call timeout and the episode ends unanswered (2026-10-01: 108 of 126
 #        multi_val episodes at 32). A split with > 1% model-call failures is refused as invalid.
 set -euo pipefail
+# EXTRA_SERVE_ARGS: extra vLLM serve flags, space-separated, no spaces inside a value
+# (Qwen3.5 on .36: --limit-mm-per-prompt {"image":0,"video":0}; text-only evals, no vision profiling).
+read -r -a EXTRA_SERVE <<< "${EXTRA_SERVE_ARGS:-}"
 BENCH=${1:?usage: $0 single|multi TAG [ADAPTER_DIR]}
 TAG=${2:?usage: $0 single|multi TAG [ADAPTER_DIR]}
 ADAPTER=${3:-}
@@ -118,7 +121,7 @@ for i in "${!GPU_SETS[@]}"; do
   # python -m, not bin/vllm: the venv was copied to .36, so its console scripts point at .29's venv.
   CUDA_VISIBLE_DEVICES=$gpus setsid "$PY" -m vllm.entrypoints.cli.main serve "$BASE" --served-model-name base --host 127.0.0.1 --port "$port" \
     --tensor-parallel-size "$tp" --max-model-len "$MAX_LEN" --gpu-memory-utilization "${GPU_UTIL:-0.80}" --dtype half \
-    --attention-backend TRITON_ATTN \
+    --attention-backend TRITON_ATTN "${EXTRA_SERVE[@]}" \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" "${SERVE_ARGS[@]}" \
     > "$OUT/server_$i.log" 2>&1 &
   PIDS+=($!)
