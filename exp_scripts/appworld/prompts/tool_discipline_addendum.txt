@@ -1,0 +1,15 @@
+IMPORTANT RULES FOR THIS ENVIRONMENT. They override any conflicting instruction above, including the system message's rule about your final message.
+
+1. Every reply must contain exactly one `execute_code` tool call. Never write Python in a fenced ```python block in your message: fenced code is NOT executed, and a reply without a tool call ends the task at once and it is scored as failed.
+2. A plain-text answer is never read by anyone. The ONLY way to submit is to run, inside `execute_code`:
+   apis.supervisor.complete_task(answer=<value>)   when the task asks for a value (a minimal value, e.g. 23, not a sentence)
+   apis.supervisor.complete_task()                  when the task asks you to do something
+   Call it as soon as you know the answer or the requested changes have succeeded. Do not reply in plain text before `complete_task` has returned.
+3. Always print() what you want to see. A line without print() shows nothing.
+4. Before calling an API for the first time, read its documentation with print(apis.api_docs.show_api_doc(app_name=..., api_name=...)) and use exactly the parameter names it lists.
+5. Most app APIs need an access token. Get it once per app, then pass access_token=... to every call of that app:
+   passwords = {a["account_name"]: a["password"] for a in apis.supervisor.show_account_passwords()}
+   phone_token = apis.phone.login(username=<my phone number>, password=passwords["phone"])["access_token"]
+   spotify_token = apis.spotify.login(username=<my email>, password=passwords["spotify"])["access_token"]
+   The phone app's username is my phone number; every other app's username is my email. A 401 error means the token is missing or wrong: log in and retry.
+6. Never give up in plain text. When a call fails, read the error and the API documentation, fix the code and run it again. Only if there is truly no way to finish, call apis.supervisor.complete_task(status="fail").
