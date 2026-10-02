@@ -34,6 +34,7 @@ import multiprocessing
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 TAIL = Path("/home/yanan/agents/gitlab/tail")
@@ -88,9 +89,27 @@ def worker(index: int, tasks: list[str], args: argparse.Namespace) -> None:
     turns: list[dict] = []
     original_chat = c.chat
 
+    tokenize_url = args.endpoint.rstrip("/").removesuffix("/v1") + "/tokenize"
+
+    def prompt_token_count(messages, tools) -> int:
+        body = {"model": args.model, "messages": messages, "tools": tools, "add_generation_prompt": True,
+                "chat_template_kwargs": {"enable_thinking": False}}
+        request = urllib.request.Request(tokenize_url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return int(json.load(response)["count"])
+
     def chat(messages, tools, temperature, max_tokens=TURN_MAX_TOKENS):
         started = time.monotonic()
-        response = original_chat(messages, tools, temperature, max_tokens=min(max_tokens, turn_cap))
+        max_tokens = min(max_tokens, turn_cap)
+        clamped = False
+        if args.max_context:
+            # A server with a shorter context than the harness assumes (.36: 32768) must not reject a call
+            # whose max_tokens is the episode's remaining wall: cap it at the room the context has left.
+            # Generation cannot run past the context anyway, so this only changes rejected calls.
+            room = args.max_context - prompt_token_count(messages, tools) - 16
+            if room < max_tokens:
+                max_tokens, clamped = max(1, room), True
+        response = original_chat(messages, tools, temperature, max_tokens=max_tokens)
         usage = response.get("usage") or {}
         choice = response["choices"][0]
         turns.append({
@@ -99,6 +118,7 @@ def worker(index: int, tasks: list[str], args: argparse.Namespace) -> None:
             "finish_reason": choice.get("finish_reason"),
             "tool_calls": len((choice.get("message") or {}).get("tool_calls") or []),
             "seconds": round(time.monotonic() - started, 2),
+            "max_tokens_clamped_to_context": clamped,
         })
         return response
 
@@ -167,6 +187,8 @@ def main() -> None:
     parser.add_argument("--episode-token-wall", type=int, default=None,
                         help="cap the whole episode's generated tokens, as the harness's max_completion_length")
     parser.add_argument("--rounds", type=int, default=1, help="independent episodes per task")
+    parser.add_argument("--max-context", type=int, default=None,
+                        help="the server's max-model-len; caps each call's max_tokens at the room left (unset = no cap)")
     parser.add_argument("--appworld-root", default=str(TAIL / "appworld"),
                         help="writable AppWorld root (data/ + experiments outputs); local disk, not NFS. "
                              "The server binary stays in the shared checkout's .venv")
