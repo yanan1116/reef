@@ -77,6 +77,18 @@ def auto_print(code: str) -> str:
 
 def worker(index: int, tasks: list[str], args: argparse.Namespace) -> None:
     c = load_collector()
+    if args.call_timeout:
+        # The collector's chat() waits 600 s per call; a slow host (.36, ~10-20 tok/s per sequence) needs
+        # longer for a long generation. Only the model endpoint's calls get the longer timeout.
+        original_urlopen = urllib.request.urlopen
+
+        def urlopen(request, *a, timeout=None, **k):
+            url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
+            if url.startswith(args.endpoint.rstrip("/")):
+                timeout = max(timeout or 0, args.call_timeout)
+            return original_urlopen(request, *a, timeout=timeout, **k)
+
+        urllib.request.urlopen = urlopen
     c.ENDPOINT = args.endpoint.rstrip("/") + "/chat/completions"
     c.MODEL = args.model
     c.API_KEY = "EMPTY"
@@ -187,6 +199,8 @@ def main() -> None:
     parser.add_argument("--episode-token-wall", type=int, default=None,
                         help="cap the whole episode's generated tokens, as the harness's max_completion_length")
     parser.add_argument("--rounds", type=int, default=1, help="independent episodes per task")
+    parser.add_argument("--call-timeout", type=int, default=None,
+                        help="seconds per model call (the collector's default is 600); for slow hosts")
     parser.add_argument("--max-context", type=int, default=None,
                         help="the server's max-model-len; caps each call's max_tokens at the room left (unset = no cap)")
     parser.add_argument("--appworld-root", default=str(TAIL / "appworld"),

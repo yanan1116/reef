@@ -17,7 +17,8 @@
 # usage: appworld_sharded.sh TAG [ADAPTER_DIR]
 #   env: MODE (base|lora), SPLIT (dev), TEMPERATURE (0.0), WORKERS per shard (4), GPU_GROUPS,
 #        PORT_BASE (18300), APPWORLD_PORT_BASE (7300), BASE, MAX_LEN (32768), OUT_ROOT, WORK,
-#        TOOL_PARSER (hermes; qwen3_coder for Qwen3.5), CHAT_TEMPLATE (a template file, optional).
+#        TOOL_PARSER (hermes; qwen3_coder for Qwen3.5), CHAT_TEMPLATE (a template file, optional),
+#        CALL_TIMEOUT (2400 s per model call; the collector's 600 s is too short on .36 for long generations).
 #        The collector already sends chat_template_kwargs {"enable_thinking": false} on every call.
 set -euo pipefail
 TAG=${1:?usage: $0 TAG [ADAPTER_DIR]}
@@ -107,7 +108,7 @@ for i in "${!GPU_SETS[@]}"; do
     --endpoint "http://127.0.0.1:$((PORT_BASE + i))/v1" --model "$MODEL_NAME" --out "$WORK/$TAG/$TAG-shard_$i" \
     --split "$SPLIT" --task-ids "$ids" --workers "$WORKERS" --port-base $((APPWORLD_PORT_BASE + 20 * i)) \
     --temperature "$TEMPERATURE" --modality code --max-steps 50 --episode-token-wall 24576 \
-    --appworld-root "$ROOT" --max-context "$MAX_LEN" > "$OUT/measure_$i.log" 2>&1 &
+    --appworld-root "$ROOT" --max-context "$MAX_LEN" --call-timeout "${CALL_TIMEOUT:-2400}" > "$OUT/measure_$i.log" 2>&1 &
   SHARD_PIDS+=($!)
 done
 for pid in "${SHARD_PIDS[@]}"; do wait "$pid" || { echo "[$TAG] a shard failed; see $OUT/measure_*.log" >&2; exit 1; }; done
