@@ -23,7 +23,15 @@ TEMPLATE_ARGS=()
 mkdir -p "$OUT"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TOKENIZERS_PARALLELISM=false VLLM_USE_V1=1 VLLM_USE_FLASHINFER_SAMPLER=0
 SPID=
-cleanup() { [ -n "$SPID" ] && kill -9 -- "-$SPID" 2>/dev/null; [ -n "$SPID" ] && wait "$SPID" 2>/dev/null; return 0; }
+cleanup() {
+  # if/|| true, not `&&`: under set -e a failing last command of an && list exits the script (a dead
+  # server's wait status), which skipped the shorter-context retry.
+  if [ -n "$SPID" ]; then
+    kill -9 -- "-$SPID" 2>/dev/null || true
+    wait "$SPID" 2>/dev/null || true
+  fi
+  return 0
+}
 trap cleanup EXIT
 for len in 49152 28672; do
   CUDA_VISIBLE_DEVICES=$GPU setsid "$PY" -m vllm.entrypoints.cli.main serve "$BASE" --served-model-name base \
