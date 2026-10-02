@@ -40,6 +40,9 @@ import openai  # noqa: E402
 from multitable_env import TOOL_SPECS, ChatModel, ModelCallRejected, flow, grade, run_episode  # noqa: E402
 
 EXPECTED_TASKS = {"multi_val": 126, "multi_test": 131}
+# The flow's per-call timeout. FINQA_CALL_TIMEOUT_S overrides it on a slow host (.36: an 8192-token final
+# answer alone outlasts 300 s there); the value used is recorded in protocol.json.
+CALL_TIMEOUT_S = int(os.environ.get("FINQA_CALL_TIMEOUT_S", str(flow.LLM_TIMEOUT_SECONDS)))
 
 
 class VllmChat(ChatModel):
@@ -55,7 +58,7 @@ class VllmChat(ChatModel):
         try:
             response = self.client.chat.completions.create(
                 model=self.model, messages=messages, tools=TOOL_SPECS, max_completion_tokens=max_tokens,
-                timeout=flow.LLM_TIMEOUT_SECONDS, extra_body=self.extra_body, **self.sampling,
+                timeout=CALL_TIMEOUT_S, extra_body=self.extra_body, **self.sampling,
             )
         except openai.OpenAIError as error:  # the flow's _create_with_retry catches every call failure
             raise ModelCallRejected(f"{type(error).__name__}: {error}") from error
@@ -114,7 +117,7 @@ def main() -> None:
     protocol = {
         "model": args.model, "split": args.split, "tasks": len(rows), "shard": args.shard, "attempts": args.attempts, "sampling": sampling,
         "max_tokens": {"tool_use": flow.DISCOVERY_MAX_COMPLETION_TOKENS, "final": flow.FINAL_MAX_COMPLETION_TOKENS},
-        "call_timeout_s": flow.LLM_TIMEOUT_SECONDS, "concurrency": args.concurrency,
+        "call_timeout_s": CALL_TIMEOUT_S, "concurrency": args.concurrency,
         "judge_model": os.environ["FINQA_MULTI_TABLE_JUDGE_MODEL"], "protocol_version": flow.PROTOCOL_VERSION,
         "final_calls_keep_tools": True, "chat_template_kwargs": template_kwargs,
     }
