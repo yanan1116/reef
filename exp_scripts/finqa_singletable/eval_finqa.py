@@ -22,6 +22,7 @@ import argparse
 import json
 import random
 import math
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +37,9 @@ import openai  # noqa: E402
 
 from finqa_env import TOOL_SPECS, ChatModel, grade, run_episode  # noqa: E402
 
-CALL_TIMEOUT_S = 300  # finqa_flow's per-call timeout
+# finqa_flow's per-call timeout. FINQA_CALL_TIMEOUT_S overrides it on a slow host (.36: a long generation
+# alone outlasts 300 s there); the value used is recorded in protocol.json.
+CALL_TIMEOUT_S = int(os.environ.get("FINQA_CALL_TIMEOUT_S", "300"))
 EXPECTED_TASKS = {"val": 522, "test": 558}
 
 
