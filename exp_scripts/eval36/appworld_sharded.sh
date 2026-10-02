@@ -21,6 +21,9 @@
 #        CALL_TIMEOUT (2400 s per model call; the collector's 600 s is too short on .36 for long generations).
 #        The collector already sends chat_template_kwargs {"enable_thinking": false} on every call.
 set -euo pipefail
+# EXTRA_SERVE_ARGS: extra vLLM serve flags, space-separated, no spaces inside a value
+# (Qwen3.5 on .36: --limit-mm-per-prompt {"image":0,"video":0}; text-only evals, no vision profiling).
+read -r -a EXTRA_SERVE <<< "${EXTRA_SERVE_ARGS:-}"
 TAG=${1:?usage: $0 TAG [ADAPTER_DIR]}
 ADAPTER=${2:-}
 MODE=${MODE:-base}
@@ -81,7 +84,7 @@ for i in "${!GPU_SETS[@]}"; do
   if curl -fsS -m 3 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; then echo "port $port is in use" >&2; exit 2; fi
   CUDA_VISIBLE_DEVICES=${GPU_SETS[$i]} setsid "$SERVE_VENV/bin/python" -m vllm.entrypoints.cli.main serve "$BASE" \
     --served-model-name base --host 127.0.0.1 --port "$port" --tensor-parallel-size 1 \
-    --max-model-len "$MAX_LEN" --gpu-memory-utilization "${GPU_UTIL:-0.80}" --dtype half --attention-backend TRITON_ATTN \
+    --max-model-len "$MAX_LEN" --gpu-memory-utilization "${GPU_UTIL:-0.80}" --dtype half --attention-backend TRITON_ATTN "${EXTRA_SERVE[@]}" \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" "${SERVE_ARGS[@]}" > "$OUT/server_$i.log" 2>&1 &
   PIDS+=($!)
 done
