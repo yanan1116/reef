@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.util
 import json
 import multiprocessing
@@ -93,6 +94,16 @@ def worker(index: int, tasks: list[str], args: argparse.Namespace) -> None:
     c.MODEL = args.model
     c.API_KEY = "EMPTY"
     c.MAX_TOOL_CALLS = args.max_steps
+    if args.prompt_addendum:
+        # Variant, not the official protocol: append fixed text to the end of the first user turn
+        # (after the react_code prompt and the harness's own lines), closest to the first generation.
+        addendum = Path(args.prompt_addendum).read_text().strip()
+        original_observation = c.harness_observation
+
+        def harness_observation(info, tool_names, modality):
+            return original_observation(info, tool_names, modality) + "\n\n" + addendum
+
+        c.harness_observation = harness_observation
     # Episode wall: the harness caps the whole episode's generated tokens (max_completion_length).
     # --episode-token-wall N reproduces it exactly (no per-turn cap, as the harness has none);
     # without it the wall is lifted and each turn is capped at TURN_MAX_TOKENS instead.
@@ -209,6 +220,14 @@ def main() -> None:
     parser.add_argument("--auto-print-last-expr", action="store_true",
                         help="variant: print a trailing bare expression's value (REPL display)")
     args = parser.parse_args()
+    # APPWORLD_PROMPT_ADDENDUM: a text file appended to the first user turn (unset = the official prompt,
+    # byte-identical to earlier runs). An environment variable so eval36/appworld_sharded.sh passes it through.
+    args.prompt_addendum = os.environ.get("APPWORLD_PROMPT_ADDENDUM", "")
+    if args.prompt_addendum and not Path(args.prompt_addendum).is_file():
+        raise SystemExit(f"APPWORLD_PROMPT_ADDENDUM={args.prompt_addendum!r} is not a readable file; "
+                         "unset it for the official prompt")
+    addendum_sha256 = (hashlib.sha256(Path(args.prompt_addendum).read_bytes()).hexdigest()
+                       if args.prompt_addendum else "")
     listing = TAIL / "appworld" / "data" / "datasets" / f"{args.split}.txt"
     tasks = [t.strip() for t in listing.read_text().splitlines() if t.strip()]
     if args.task_ids:
@@ -217,7 +236,8 @@ def main() -> None:
     (Path(args.out) / "config.json").write_text(json.dumps({**vars(args), "tasks": len(tasks),
                                                             "turn_max_tokens": TURN_MAX_TOKENS,
                                                             "auth_hint_env": os.environ.get("GRPO_VANILLA_APPWORLD_AUTH_HINT", "1"),
-                                                            "react_prompt_env": os.environ.get("GRPO_VANILLA_APPWORLD_REACT_PROMPT", "")}))
+                                                            "react_prompt_env": os.environ.get("GRPO_VANILLA_APPWORLD_REACT_PROMPT", ""),
+                                                            "prompt_addendum_sha256": addendum_sha256}))
     print(f"[measure] {len(tasks)} tasks, {args.workers} workers, endpoint {args.endpoint}", flush=True)
     jobs = [(t, r) for r in range(1, args.rounds + 1) for t in tasks]
     slices = [jobs[i::args.workers] for i in range(args.workers)]
