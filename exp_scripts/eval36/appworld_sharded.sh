@@ -73,7 +73,9 @@ cleanup() {
   for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
   # AppWorld servers start in their own sessions; stop any this run left behind (by port range).
   for ((p=APPWORLD_PORT_BASE; p<APPWORLD_PORT_BASE+N*20; p++)); do
-    pid=$(ss -ltnp "sport = :$p" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+    # || true: a free port makes grep fail, and under set -e + pipefail that exited the trap with 1
+    # after a complete run.
+    pid=$(ss -ltnp "sport = :$p" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2) || true
     [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
   done
   return 0
