@@ -8,6 +8,9 @@
 # usage: smoke_model.sh OUT_DIR ; env BASE, TOOL_PARSER (hermes), CHAT_TEMPLATE, CHAT_TEMPLATE_KWARGS,
 #        GPU (0), PORT (18400), GPU_UTIL (0.80)
 set -euo pipefail
+# EXTRA_SERVE_ARGS: extra vLLM serve flags, space-separated, no spaces inside a value
+# (Qwen3.5 on .36: --limit-mm-per-prompt {"image":0,"video":0}; text-only evals, no vision profiling).
+read -r -a EXTRA_SERVE <<< "${EXTRA_SERVE_ARGS:-}"
 OUT=${1:?usage: $0 OUT_DIR}
 GPU=${GPU:-0}
 PORT=${PORT:-18400}
@@ -25,7 +28,7 @@ trap cleanup EXIT
 for len in 49152 28672; do
   CUDA_VISIBLE_DEVICES=$GPU setsid "$PY" -m vllm.entrypoints.cli.main serve "$BASE" --served-model-name base \
     --host 127.0.0.1 --port "$PORT" --max-model-len "$len" --gpu-memory-utilization "${GPU_UTIL:-0.80}" --dtype half \
-    --attention-backend TRITON_ATTN --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" \
+    --attention-backend TRITON_ATTN "${EXTRA_SERVE[@]}" --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" "${TEMPLATE_ARGS[@]}" \
     > "$OUT/server_$len.log" 2>&1 &
   SPID=$!
   ready=0
@@ -36,9 +39,9 @@ for len in 49152 28672; do
   done
   [ "$ready" = 1 ] && { echo "$len" > "$OUT/max_model_len"; break; }
   cleanup; SPID=
-  grep -qE "KV cache is needed|larger than the available KV cache" "$OUT/server_$len.log" \
+  grep -qE "KV cache is needed|larger than the available KV cache|OutOfMemoryError|CUDA out of memory" "$OUT/server_$len.log" \
     || { echo "[smoke] server failed to start at max-model-len $len (not a KV-size limit); see $OUT/server_$len.log" >&2; exit 1; }
-  echo "[smoke] max-model-len $len does not fit the KV cache; trying a shorter one"
+  echo "[smoke] max-model-len $len does not fit one GPU (KV cache or startup OOM); trying a shorter one"
 done
 [ -s "$OUT/max_model_len" ] || { echo "[smoke] no max-model-len fits on one GPU" >&2; exit 1; }
 echo "[smoke] server up at max-model-len $(cat "$OUT/max_model_len"); $(grep -hoE 'GPU KV cache size: [0-9,]+ tokens' "$OUT"/server_*.log | tail -1)"
