@@ -265,6 +265,16 @@ class SlimeAlgorithm(ABC):
     """
     critic_value_mask_key: str | None = None
     """Microbatch key selecting the tokens the critic's explained-variance metric covers."""
+    critic_prefix_key: str | None = None
+    """Rollout-data key of per-sample token ids only the critic reads, before each sequence.
+
+    A privileged value function (arXiv:2608.16739) conditions the value model
+    on context the policy never sees. The critic worker prepends these ids to
+    its own copy of each sample's tokens; values stay response-aligned because
+    Slime reads them from the sequence end. The actor's batch is untouched. The
+    key must also appear in ``rollout_data_keys`` and ``rollout_tensor_dtypes``;
+    a batch without it trains the critic exactly as before.
+    """
     required_objective_hooks: tuple[str, ...] = ()
     """Worker-side objective channels that must be registered during init."""
     critic_value_head_zero_init: bool = False

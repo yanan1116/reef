@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-SERVICE_URL = "http://127.0.0.1:8900"
+SERVICE_URL = os.environ.get("REEF_SERVICE_URL", "http://127.0.0.1:8900")
 TOKEN = "reef-local"
 SCENARIO = os.environ.get("SAO_SCENARIO", "sao-deepcoder")
 PROGRESS_FILE = Path(os.environ["SAO_PROGRESS_FILE"])

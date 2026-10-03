@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from recipes.sao.processor import SAOProcessor
-from reef.core.reports import ReportBase, ScoredRolloutReport
+from recipes.sao.report import SAOReport
+from reef.core.reports import ReportBase
 from reef.recipe.base import WeightTrainingRecipe, WeightTrainingSpec
 from reef.recipe.config_fields import config_field
 from reef.recipe.errors import RecipeConfigError
@@ -37,14 +38,23 @@ class SAORecipe(WeightTrainingRecipe):
 
     ``batch_size`` must equal the Slime driver's ``--global-batch-size``: each
     rollout sample is its own DP unit.
+
+    ``privileged_value`` turns the critic into a privileged value function
+    (arXiv:2608.16739): every report must carry a ``critic_context``, which
+    the served model's tokenizer (``tokenizer_path``) renders as a system
+    turn that only the critic reads, before the sample. The actor's sample,
+    the DIS ratio, the loss and the GAE are unchanged; off, a report carrying
+    a context is rejected, so the flag alone decides which arm a run is.
     """
 
     name: str = "sao"
     batch_size: int = config_field(128, env="REEF_SAO_BATCH_SIZE")
+    privileged_value: bool = config_field(False)
+    tokenizer_path: str = config_field("")
 
     @property
     def report_type(self) -> type[ReportBase]:
-        return ScoredRolloutReport
+        return SAOReport
 
     @classmethod
     def training_spec(cls) -> WeightTrainingSpec:
@@ -59,6 +69,10 @@ class SAORecipe(WeightTrainingRecipe):
         super().__post_init__()
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if self.privileged_value and not self.tokenizer_path.strip():
+            raise ValueError(
+                "privileged_value needs tokenizer_path: the served model's tokenizer renders the critic context"
+            )
 
     @classmethod
     def _validate_config(cls, settings: Mapping[str, Any]) -> None:

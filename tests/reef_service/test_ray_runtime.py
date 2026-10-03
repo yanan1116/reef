@@ -489,8 +489,9 @@ def test_slime_backend_preparation_emits_framework_agnostic_rows() -> None:
 @pytest.mark.unit
 @pytest.mark.unit
 def test_slime_backend_preparation_emits_sao_rows_with_action_mask_and_source_fields() -> None:
-    # SAO ships an 8-element row: the action mask (for skip-observation GAE)
-    # and rollout source fields (producing runtime load ID, creation time) have no
+    # SAO ships a 9-element row: the action mask (for skip-observation GAE),
+    # rollout source fields (producing runtime load ID, creation time) and the
+    # critic-only prefix (empty without a privileged value function) have no
     # slot in the policy 5-tuple. Each sample is its own rollout (no grouping)
     # and advantages are never shipped — the critic computes them in-backend.
     batch = TrainingBatch(
@@ -526,6 +527,7 @@ def test_slime_backend_preparation_emits_sao_rows_with_action_mask_and_source_fi
             [1, 0, 1],
             "slime-v3",
             1234.5,
+            [],
         ]
     ]
 
@@ -552,7 +554,7 @@ def test_slime_backend_preparation_sao_rows_tolerate_missing_source_fields() -> 
 
     # A rollout served before runtime-load-ID tracking still ships; the last two
     # slots carry None rather than dropping the row.
-    assert payload["samples"][0][-2:] == [None, None]
+    assert payload["samples"][0][-3:] == [None, None, []]
 
 
 def sao_batch(runtime_load_id: str | None = "slime-v3") -> TrainingBatch:

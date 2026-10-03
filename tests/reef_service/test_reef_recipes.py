@@ -11,6 +11,7 @@ from reef_service.runtime_stubs import StubTrainingRuntime, runtime_bindings
 
 from recipes.openclawrl import OpenClawRLProcessor, OpenClawRLRecipe
 from recipes.sao import SAOProcessor, SAORecipe
+from recipes.sao.report import SAOReport
 from recipes.tttd import TTTDGroupedRolloutReport, TTTDProcessor, TTTDRecipe
 from reef.core import AgentRecord, RequestType
 from reef.core.reports import ScoredRolloutReport
@@ -92,7 +93,7 @@ def test_dotted_recipe_rejects_bad_references(reference: str, match: str) -> Non
             "sao",
             SAOProcessor,
             "sao",
-            ScoredRolloutReport,
+            SAOReport,
         ),
         (
             TTTDRecipe(**runtime_bindings(StubTrainingRuntime()), groups_per_step=2, rollouts_per_group=3),

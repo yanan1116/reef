@@ -49,6 +49,9 @@ Environment (defaults are the multi-table formal run):
   SAO_CONTEXT_TOKENS served context (default 49152 = the recipe's context-length and rllm's max_model_len)
   SAO_MAX_SAMPLE_TOKENS  longest assembled sample reported for training (default 16384)
   SAO_SYNC_BATCHES   1 (default): sample each batch with one weight version; 0: stream as the FinQA driver
+  SAO_PVF_CONTEXT    privileged value function (arXiv:2608.16739), as finqa_singletable/stream_finqa.py:
+                     "" (default): plain SAO; "answer": the gold answer (multi-table: the reference
+                     analysis, median ~1.4k tokens); "answer_explanation": plus the dataset's explanation.
   SAO_MODEL_PATH     tokenizer used to count prompt tokens (default the 2507 HF snapshot)
   SAO_CALL_TIMEOUT_S one model call through Reef (default 1800)
   SAO_RECORDS_PATH   one JSON line per episode (reported or dropped)
@@ -89,7 +92,7 @@ os.environ.setdefault("FINQA_MULTI_TABLE_JUDGE_MODEL", "gpt-5.4-nano")  # before
 load_judge_env()
 from multitable_env import TOOL_SPECS, ChatModel, ModelCallRejected, MultiTableEpisode, grade, run_episode  # noqa: E402
 
-SERVICE_URL = "http://127.0.0.1:8900"
+SERVICE_URL = os.environ.get("REEF_SERVICE_URL", "http://127.0.0.1:8900")
 TOKEN = "reef-local"
 SCENARIO = os.environ.get("SAO_SCENARIO", "sao-finqa-multitable")
 RECIPE = "sao"
@@ -102,6 +105,10 @@ TOP_P = float(os.environ.get("SAO_TOP_P", "1.0"))
 CONTEXT_TOKENS = int(os.environ.get("SAO_CONTEXT_TOKENS", "49152"))
 MAX_SAMPLE_TOKENS = int(os.environ.get("SAO_MAX_SAMPLE_TOKENS", "16384"))
 SYNC_BATCHES = os.environ.get("SAO_SYNC_BATCHES", "1") == "1"
+PVF_CONTEXT = os.environ.get("SAO_PVF_CONTEXT", "")
+PVF_CONTEXTS = ("", "answer", "answer_explanation")
+if PVF_CONTEXT not in PVF_CONTEXTS:
+    raise SystemExit(f"SAO_PVF_CONTEXT must be one of {PVF_CONTEXTS}, got {PVF_CONTEXT!r}")
 MODEL_PATH = os.environ.get(
     "SAO_MODEL_PATH",
     "/home/yanan/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554",
@@ -295,6 +302,24 @@ def check_reef_source() -> None:
         )
 
 
+def critic_context(task: dict) -> str:
+    """The privileged text the critic reads for ``task`` (SAO_PVF_CONTEXT); empty for plain SAO.
+
+    Same wording as the single-table driver. It comes from the dataset, never from the rollout,
+    so it is independent of the policy's actions.
+    """
+    if not PVF_CONTEXT:
+        return ""
+    lines = [
+        "Privileged information for estimating how well the assistant will do on this task. "
+        "The assistant never sees it.",
+        f"Reference final answer: {task['ground_truth']}",
+    ]
+    if PVF_CONTEXT == "answer_explanation":
+        lines.append(f"Reference explanation: {task['explanation']}")
+    return "\n".join(lines)
+
+
 def one_episode(client: ReefClient, model: str, problem: dict, position: int) -> dict:
     started = time.time()
     release = serving_release()
@@ -358,7 +383,11 @@ def one_episode(client: ReefClient, model: str, problem: dict, position: int) ->
         write_record(record)
         raise SampleTooLong(f"problem {problem['problem_idx']}: assembled sample of {sample_tokens} tokens > {MAX_SAMPLE_TOKENS}")
     score, is_correct, grading = grade(problem["task"], episode)
-    client.report(SCENARIO, {"score": score, "references": record["agent_record_ids"]}, recipe=RECIPE)
+    report = {"score": score, "references": record["agent_record_ids"]}
+    context = critic_context(problem["task"])
+    if context:
+        report["metadata"] = {"critic_context": context}
+    client.report(SCENARIO, report, recipe=RECIPE)
     record.update(score=score, is_correct=is_correct, table_access=grading.get("table_access"), recorded_at=time.time())
     write_record(record)
     print(
@@ -451,7 +480,8 @@ def main() -> None:
     print(
         f"pool={len(problems)} tasks, budget={BUDGET}, batch={BATCH}, in_flight={IN_FLIGHT}, "
         f"temperature={TEMPERATURE}, top_p={TOP_P}, context={CONTEXT_TOKENS}, "
-        f"judge={os.environ['FINQA_MULTI_TABLE_JUDGE_MODEL']}, sync_batches={SYNC_BATCHES}",
+        f"judge={os.environ['FINQA_MULTI_TABLE_JUDGE_MODEL']}, sync_batches={SYNC_BATCHES}, "
+        f"pvf_context={PVF_CONTEXT or 'none'}",
         flush=True,
     )
 
