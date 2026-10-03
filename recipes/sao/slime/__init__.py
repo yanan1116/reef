@@ -56,12 +56,17 @@ class SaoAlgorithm(SlimeAlgorithm):
     # ``rollout_created_ats`` is consumed driver-side by ``rollout_metrics``
     # and dropped before the workers see it; the skip key keeps the numeric
     # rollout logger safe if that ever changes.
-    rollout_data_keys = ("action_masks",)
-    rollout_tensor_dtypes: Mapping[str, str] = {"action_masks": "int"}
+    rollout_data_keys = ("action_masks", "critic_prefix_tokens")
+    rollout_tensor_dtypes: Mapping[str, str] = {"action_masks": "int", "critic_prefix_tokens": "long"}
     response_aligned_keys = ("action_masks",)
     external_batch_keys = ("action_masks",)
     critic_value_mask_key = "action_masks"
-    rollout_log_skip_keys = ("rollout_created_ats",)
+    rollout_log_skip_keys = ("rollout_created_ats", "critic_prefix_tokens")
+    # Privileged value function (arXiv:2608.16739): a report's ``critic_context``
+    # arrives as token ids the critic worker prepends to its own copy of the
+    # sample; the actor never reads them. A batch without the key (no report
+    # carried a context) is the plain SAO critic.
+    critic_prefix_key = "critic_prefix_tokens"
     # The critic's scalar value head has no counterpart in the HF checkpoint;
     # its bias keeps the worker-local zero initialization.
     critic_value_head_zero_init = True
