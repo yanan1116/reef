@@ -32,8 +32,9 @@ def _sao_row(
     reward: float = 0.5,
     producing_runtime_load_id: str | None = "slime-v3",
     rollout_created_at: float | None = 1234.5,
+    critic_prefix_tokens: list[int] | None = None,
 ) -> list[object]:
-    """One 8-element SAO row as emitted by Reef's remote handle."""
+    """One 9-element SAO row as emitted by Reef's remote handle."""
     tokens = [9, 1, 2, 3] if tokens is None else tokens
     loss_mask = [1, 1, 1] if loss_mask is None else loss_mask
     action_mask = list(loss_mask) if action_mask is None else action_mask
@@ -47,6 +48,7 @@ def _sao_row(
         action_mask,
         producing_runtime_load_id,
         rollout_created_at,
+        [] if critic_prefix_tokens is None else critic_prefix_tokens,
     ]
 
 

@@ -44,6 +44,10 @@ Environment (defaults are the FinQA formal run):
   SAO_MAX_PROMPT_TOKENS  a longer turn prompt ends the episode unanswered (8192)
   SAO_CALL_TIMEOUT_S one model call through Reef (default 1800)
   SAO_SYNC_BATCHES   1: sample each batch with one weight version (see above); 0 (default): stream
+  SAO_PVF_CONTEXT    privileged value function (arXiv:2608.16739): the text only the critic reads,
+                     sent as the report's critic_context. "" (default): plain SAO; "answer": the
+                     gold final answer; "answer_explanation": the answer and the dataset's
+                     explanation. The recipe's privileged_value must be on exactly when it is set.
   SAO_RECORDS_PATH   one JSON line per episode (reported or dropped)
   SAO_PROGRESS_FILE, SAO_AHEAD, SAO_STALL_S, SAO_SEED, SAO_TRAIN_DRAIN_TIMEOUT_S  as in deepcoder/stream.py
   FINQA_JUDGE_CREDS  judge credentials file (default exp_scripts/finqa/.judge_creds)
@@ -78,7 +82,7 @@ from judge_env import load_judge_env  # noqa: E402
 load_judge_env()
 from finqa_env import TOOL_SPECS, ChatModel, EpisodeResult, grade, run_episode  # noqa: E402
 
-SERVICE_URL = "http://127.0.0.1:8900"
+SERVICE_URL = os.environ.get("REEF_SERVICE_URL", "http://127.0.0.1:8900")
 TOKEN = "reef-local"
 SCENARIO = os.environ.get("SAO_SCENARIO", "sao-finqa")
 RECIPE = "sao"
@@ -92,6 +96,10 @@ MAX_TOKENS = int(os.environ.get("SAO_MAX_TOKENS", "2048"))
 MAX_PROMPT_TOKENS = int(os.environ.get("SAO_MAX_PROMPT_TOKENS", "8192"))
 CALL_TIMEOUT_S = float(os.environ.get("SAO_CALL_TIMEOUT_S", "1800"))
 SYNC_BATCHES = os.environ.get("SAO_SYNC_BATCHES", "0") == "1"
+PVF_CONTEXT = os.environ.get("SAO_PVF_CONTEXT", "")
+PVF_CONTEXTS = ("", "answer", "answer_explanation")
+if PVF_CONTEXT not in PVF_CONTEXTS:
+    raise SystemExit(f"SAO_PVF_CONTEXT must be one of {PVF_CONTEXTS}, got {PVF_CONTEXT!r}")
 RECORDS_PATH = Path(os.environ.get("SAO_RECORDS_PATH", "work/records/finqa.jsonl"))
 SEED = int(os.environ.get("SAO_SEED", "0"))
 TRAIN_DRAIN_TIMEOUT_S = int(os.environ.get("SAO_TRAIN_DRAIN_TIMEOUT_S", "14400"))
@@ -268,6 +276,23 @@ def check_reef_source() -> None:
         )
 
 
+def critic_context(task: dict) -> str:
+    """The privileged text the critic reads for ``task`` (SAO_PVF_CONTEXT); empty for plain SAO.
+
+    It comes from the dataset, never from the rollout, so it is independent of the policy's actions.
+    """
+    if not PVF_CONTEXT:
+        return ""
+    lines = [
+        "Privileged information for estimating how well the assistant will do on this task. "
+        "The assistant never sees it.",
+        f"Reference final answer: {task['ground_truth']}",
+    ]
+    if PVF_CONTEXT == "answer_explanation":
+        lines.append(f"Reference explanation: {task['explanation']}")
+    return "\n".join(lines)
+
+
 def one_episode(client: ReefClient, model: str, problem: dict, position: int) -> dict:
     started = time.time()
     release = serving_release()
@@ -317,7 +342,11 @@ def one_episode(client: ReefClient, model: str, problem: dict, position: int) ->
         write_record(record)
         raise VersionStraddle(f"problem {problem['problem_idx']} spans versions {record['runtime_load_ids'] or 'unknown'}")
     score, is_correct, grading = grade(problem["task"], episode)
-    client.report(SCENARIO, {"score": score, "references": record["agent_record_ids"]}, recipe=RECIPE)
+    report = {"score": score, "references": record["agent_record_ids"]}
+    context = critic_context(problem["task"])
+    if context:
+        report["metadata"] = {"critic_context": context}
+    client.report(SCENARIO, report, recipe=RECIPE)
     record.update(score=score, is_correct=is_correct, table_access=grading.get("table_access"), recorded_at=time.time())
     write_record(record)
     print(
@@ -409,7 +438,8 @@ def main() -> None:
     pacer = TrainerPacer(PROGRESS_FILE)
     print(
         f"pool={len(problems)} tasks, budget={BUDGET}, batch={BATCH}, in_flight={IN_FLIGHT}, "
-        f"temperature={TEMPERATURE}, top_p={TOP_P}, max_tokens/turn={MAX_TOKENS}, sync_batches={SYNC_BATCHES}",
+        f"temperature={TEMPERATURE}, top_p={TOP_P}, max_tokens/turn={MAX_TOKENS}, sync_batches={SYNC_BATCHES}, "
+        f"pvf_context={PVF_CONTEXT or 'none'}",
         flush=True,
     )
 

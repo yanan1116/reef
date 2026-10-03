@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,46 @@ from reef.train.slime_backend.reef_adapters.worker_hooks import (
     reef_node_ip_and_free_port,
     resolve_tensor_dtype,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _prepend_critic_prefix(rollout_data: dict[str, Any], prefixes: list[torch.Tensor], device: int) -> None:
+    """Put each sample's critic-only prefix ids in front of the critic's copy of its tokens.
+
+    Slime reads values from the sequence end (``get_responses`` walks
+    ``total_lengths`` and slices the last ``response_length`` positions), so
+    the value of every response token keeps its index while its context grows
+    by the prefix. Response-aligned tensors were sliced for context
+    parallelism against the unprefixed lengths, so a prefix needs CP 1.
+    """
+    from megatron.core import mpu
+
+    if mpu.get_context_parallel_world_size() != 1:
+        raise RuntimeError(
+            "a critic prefix (privileged value function) needs context parallel size 1: response-aligned "
+            f"tensors are sliced against the unprefixed lengths; got {mpu.get_context_parallel_world_size()}"
+        )
+    tokens = rollout_data["tokens"]
+    if len(prefixes) != len(tokens):
+        raise RuntimeError(f"critic prefixes cover {len(prefixes)} samples, the batch has {len(tokens)}")
+    lengths = [int(prefix.numel()) for prefix in prefixes]
+    rollout_data["tokens"] = [
+        torch.cat([prefix.to(device=device, dtype=torch.long), sample]) if length else sample
+        for prefix, sample, length in zip(prefixes, tokens, lengths, strict=True)
+    ]
+    rollout_data["total_lengths"] = [
+        int(total) + length for total, length in zip(rollout_data["total_lengths"], lengths, strict=True)
+    ]
+    # A log line, not a worker metric: the bridge drains metrics from the actor group only.
+    logger.info(
+        "critic prefix (privileged value): %d of %d samples, prefix tokens mean %.1f max %d",
+        sum(1 for length in lengths if length),
+        len(lengths),
+        sum(lengths) / max(len(lengths), 1),
+        max(lengths, default=0),
+    )
 
 
 def _loss_family_hook(args: Any, arg_name: str) -> Any:
@@ -194,6 +235,9 @@ class ReefMegatronTrainRayActor(MegatronTrainRayActor):
                     strict=True,
                 )
             ]
+        prefix_key = spec.critic_prefix_key if spec is not None else None
+        if self.role == "critic" and prefix_key and prefix_key in rollout_data:
+            _prepend_critic_prefix(rollout_data, rollout_data.pop(prefix_key), device)
         return rollout_data
 
     def get_runtime_load_id(self) -> str:

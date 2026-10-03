@@ -505,6 +505,7 @@ def _sao_durable_actor(
             [1, 1],
             producing_version,
             1234.5,
+            [],
         ]
         for index, producing_version in enumerate(producing_versions)
     ]
@@ -1391,6 +1392,7 @@ def test_complete_marker_republishes_checkpoint_with_its_original_runtime_load_i
                 [1, 1],
                 "checkpoint-incarnation:1",
                 1234.5,
+                [],
             ]
         ],
         "rollout_ids": [0],
