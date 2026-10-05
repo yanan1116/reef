@@ -23,9 +23,9 @@ recipes/sao/examples/imo_answerbench/stream.py plus task edits). What differs:
   assemble -- turns from different weight versions, a turn generated across a
   publication, a reply without a version, a token fork -- is not reported: it
   is recorded as dropped and its task goes back into the queue.
-* Synchronous batches (SAO_SYNC_BATCHES=1; default 0 = the streaming mode the formal run
+* Synchronous batches (--sync; without it, the streaming mode the formal run
   finqa-b64-20260927T004448 used): the same barrier as finqa_multitable/stream_multitable.py.
-  Only one optimizer step's episodes are sampled (reported + in flight <= SAO_BATCH, failed or
+  Only one optimizer step's episodes are sampled (reported + in flight <= --batch, failed or
   dropped episodes topped up), and the next batch waits until that step is published, so every
   batch comes from one weight version and nothing is in flight at a publication.
 * Failures: an infrastructure error (Reef/engine down, connection, timeout) is
@@ -34,31 +34,19 @@ recipes/sao/examples/imo_answerbench/stream.py plus task edits). What differs:
   episode with no answer and is scored 0 and reported, as finqa_flow scored it
   in the PRPO runs.
 
-Environment (defaults are the FinQA formal run):
-  SAO_PROBLEMS       finqa_train.jsonl from export_finqa.py (required)
-  SAO_SCENARIO       Reef scenario (default sao-finqa)
-  SAO_BATCH          episodes per optimizer step; = recipe batch-size (default 64)
-  SAO_IN_FLIGHT      concurrent episodes (default 64)
-  SAO_BUDGET         reported episodes before the driver stops (default 39680 = 620 steps x 64 = 10 epochs)
-  SAO_TEMPERATURE, SAO_TOP_P, SAO_MAX_TOKENS   per-turn sampling (0.7, 1.0, 2048)
-  SAO_MAX_PROMPT_TOKENS  a longer turn prompt ends the episode unanswered (8192)
-  SAO_CALL_TIMEOUT_S one model call through Reef (default 1800)
-  SAO_SYNC_BATCHES   1: sample each batch with one weight version (see above); 0 (default): stream
-  SAO_PVF_CONTEXT    privileged value function (arXiv:2608.16739): the text only the critic reads,
-                     sent as the report's critic_context. "" (default): plain SAO; "answer": the
-                     gold final answer; "answer_explanation": the answer and the dataset's
-                     explanation. The recipe's privileged_value must be on exactly when it is set.
-  SAO_RECORDS_PATH   one JSON line per episode (reported or dropped)
-  SAO_PROGRESS_FILE, SAO_AHEAD, SAO_STALL_S, SAO_SEED, SAO_TRAIN_DRAIN_TIMEOUT_S  as in deepcoder/stream.py
-  FINQA_JUDGE_CREDS  judge credentials file (default exp_scripts/finqa/.judge_creds)
+Settings are command-line flags (--help); the defaults are the FinQA formal run. Experiment
+switches are off unless passed: --sync (synchronous batches, above) and one of --pvf,
+--pvf_explanation, --pvf_enhanced (privileged value function). FINQA_JUDGE_CREDS (judge
+credentials file, default exp_scripts/finqa/.judge_creds) stays an environment variable: the
+judge module reads it, and the evaluation shares that module.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
-import subprocess
 import sys
 import threading
 import time
@@ -68,6 +56,46 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from reef_client import ReefClient, ReefClientError
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Stream FinQA single-table episodes through Reef for SAO.")
+    parser.add_argument("--problems", required=True, help="finqa_train.jsonl from export_finqa.py")
+    parser.add_argument("--reef_service_url", default="http://127.0.0.1:8900")
+    parser.add_argument("--scenario", default="sao-finqa", help="Reef scenario")
+    parser.add_argument("--model_name", default="reef", help="model name sent with each chat request")
+    parser.add_argument("--batch", type=int, default=64, help="episodes per optimizer step; = the recipe's batch-size")
+    parser.add_argument("--in_flight", type=int, default=64, help="concurrent episodes")
+    parser.add_argument("--budget", type=int, default=620 * 64,
+                        help="reported episodes before the driver stops (620 steps x 64 = 10 epochs)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="= the recipe's rollout-temperature (the DIS ratio needs them equal)")
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--max_tokens", type=int, default=2048, help="new tokens per turn (PRPO max_response_length)")
+    parser.add_argument("--max_prompt_tokens", type=int, default=8192,
+                        help="a longer turn prompt ends the episode unanswered (PRPO max_prompt_length)")
+    parser.add_argument("--call_timeout_s", type=float, default=1800, help="one model call through Reef")
+    parser.add_argument("--records_path", default="work/records/finqa.jsonl",
+                        help="one JSON line per episode (reported or dropped)")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--progress_file", help="the trainer's step counter; --ahead and --stall_s as in deepcoder/stream.py")
+    parser.add_argument("--ahead", type=int, default=3)
+    parser.add_argument("--stall_s", type=int, default=2700)
+    parser.add_argument("--train_drain_timeout_s", type=int, default=14400)
+    parser.add_argument("--sync", action="store_true",
+                        help="sample each batch with one weight version (module docstring); default: stream")
+    # Privileged value function (arXiv:2608.16739): text only the critic reads, sent as the report's
+    # critic_context. The recipe's privileged-value must be on exactly when one of these is passed.
+    pvf = parser.add_mutually_exclusive_group()
+    pvf.add_argument("--pvf", action="store_true", help="PVF: the critic reads the gold final answer")
+    pvf.add_argument("--pvf_explanation", action="store_true",
+                     help="PVF: the gold answer and the dataset's explanation")
+    pvf.add_argument("--pvf_enhanced", action="store_true",
+                     help="PVF: the gold table, rows and columns, then the explanation and the answer")
+    return parser.parse_args()
+
+
+ARGS = parse_args()
 
 HERE = Path(__file__).resolve().parent
 REEF_ROOT = HERE.parents[1]  # the reef fork checkout the image was built from
@@ -82,30 +110,31 @@ from judge_env import load_judge_env  # noqa: E402
 load_judge_env()
 from finqa_env import TOOL_SPECS, ChatModel, EpisodeResult, grade, run_episode  # noqa: E402
 
-SERVICE_URL = os.environ.get("REEF_SERVICE_URL", "http://127.0.0.1:8900")
+SERVICE_URL = ARGS.reef_service_url
 TOKEN = "reef-local"
-SCENARIO = os.environ.get("SAO_SCENARIO", "sao-finqa")
+SCENARIO = ARGS.scenario
 RECIPE = "sao"
 
-BATCH = int(os.environ.get("SAO_BATCH", "64"))
-IN_FLIGHT = int(os.environ.get("SAO_IN_FLIGHT", "64"))
-BUDGET = int(os.environ.get("SAO_BUDGET", str(620 * 64)))
-TEMPERATURE = float(os.environ.get("SAO_TEMPERATURE", "0.7"))
-TOP_P = float(os.environ.get("SAO_TOP_P", "1.0"))
-MAX_TOKENS = int(os.environ.get("SAO_MAX_TOKENS", "2048"))
-MAX_PROMPT_TOKENS = int(os.environ.get("SAO_MAX_PROMPT_TOKENS", "8192"))
-CALL_TIMEOUT_S = float(os.environ.get("SAO_CALL_TIMEOUT_S", "1800"))
-SYNC_BATCHES = os.environ.get("SAO_SYNC_BATCHES", "0") == "1"
-PVF_CONTEXT = os.environ.get("SAO_PVF_CONTEXT", "")
-PVF_CONTEXTS = ("", "answer", "answer_explanation")
-if PVF_CONTEXT not in PVF_CONTEXTS:
-    raise SystemExit(f"SAO_PVF_CONTEXT must be one of {PVF_CONTEXTS}, got {PVF_CONTEXT!r}")
-RECORDS_PATH = Path(os.environ.get("SAO_RECORDS_PATH", "work/records/finqa.jsonl"))
-SEED = int(os.environ.get("SAO_SEED", "0"))
-TRAIN_DRAIN_TIMEOUT_S = int(os.environ.get("SAO_TRAIN_DRAIN_TIMEOUT_S", "14400"))
-PROGRESS_FILE = os.environ.get("SAO_PROGRESS_FILE")
-AHEAD = int(os.environ.get("SAO_AHEAD", "3"))
-STALL_S = int(os.environ.get("SAO_STALL_S", "2700"))
+BATCH = ARGS.batch
+IN_FLIGHT = ARGS.in_flight
+BUDGET = ARGS.budget
+TEMPERATURE = ARGS.temperature
+TOP_P = ARGS.top_p
+MAX_TOKENS = ARGS.max_tokens
+MAX_PROMPT_TOKENS = ARGS.max_prompt_tokens
+CALL_TIMEOUT_S = ARGS.call_timeout_s
+SYNC_BATCHES = ARGS.sync
+# The critic_context mode each PVF flag selects; "" is plain SAO.
+PVF_CONTEXT = ("location_explanation_answer" if ARGS.pvf_enhanced
+               else "answer_explanation" if ARGS.pvf_explanation
+               else "answer" if ARGS.pvf
+               else "")
+RECORDS_PATH = Path(ARGS.records_path)
+SEED = ARGS.seed
+TRAIN_DRAIN_TIMEOUT_S = ARGS.train_drain_timeout_s
+PROGRESS_FILE = ARGS.progress_file
+AHEAD = ARGS.ahead
+STALL_S = ARGS.stall_s
 REALIGN_THRESHOLD = 1024  # = sao_multiturn.MultiTurnSAORecipe realign_threshold
 SCAFFOLD_TOLERANCE = 0    # = sao_multiturn.MultiTurnSAORecipe scaffold_tolerance
 MAX_FAILURE_STREAK = 24
@@ -129,9 +158,7 @@ class VersionStraddle(RuntimeError):
 
 
 def load_problems() -> list[dict]:
-    path = os.environ.get("SAO_PROBLEMS")
-    if not path:
-        raise SystemExit("SAO_PROBLEMS must point at finqa_train.jsonl (export_finqa.py)")
+    path = ARGS.problems
     with open(path) as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
     if not rows or any(row.get("split") != "train" for row in rows):
@@ -260,34 +287,26 @@ def turn_versions(record: AgentRecord) -> set[str]:
     return {str(recorded)} if recorded else set()
 
 
-def check_reef_source() -> None:
-    """The assembly imported here must be the image's: the image tag names the Reef source commit."""
-    image = os.environ.get("IMAGE", "")
-    git = ["git", "-C", str(REEF_ROOT), "-c", "safe.directory=*"]
-    commit = subprocess.run([*git, "log", "-1", "--format=%h", "--", ".", ":(exclude)exp_scripts"],
-                            capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run([*git, "status", "--porcelain", "--", ".", ":(exclude)exp_scripts"],
-                           capture_output=True, text=True, check=True).stdout.strip()
-    if image != f"reef:sao-{commit}" or dirty:
-        raise SystemExit(
-            f"expected IMAGE=reef:sao-{commit} and a clean Reef source tree; got IMAGE={image!r}, "
-            f"uncommitted changes: {dirty or 'none'}. The driver checks episodes with Reef's assembly code "
-            f"from {REEF_ROOT}, which must be the code the stack runs: rebuild the image or check out its commit."
-        )
-
-
 def critic_context(task: dict) -> str:
-    """The privileged text the critic reads for ``task`` (SAO_PVF_CONTEXT); empty for plain SAO.
+    """The privileged text the critic reads for ``task`` (--pvf*); empty for plain SAO.
 
     It comes from the dataset, never from the rollout, so it is independent of the policy's actions.
     """
     if not PVF_CONTEXT:
         return ""
-    lines = [
-        "Privileged information for estimating how well the assistant will do on this task. "
-        "The assistant never sees it.",
-        f"Reference final answer: {task['ground_truth']}",
-    ]
+    header = ("Privileged information for estimating how well the assistant will do on this task. "
+              "The assistant never sees it.")
+    if PVF_CONTEXT == "location_explanation_answer":
+        # Where the evidence is and how it combines, so the critic can judge each lookup mid-episode, not
+        # only the final answer (2026-10-03). Empty rows/columns (multi-table) are left out.
+        lines = [header, f"Gold tables: {', '.join(task['table_name'])}"]
+        if task.get("rows_used"):
+            lines.append(f"Gold rows: {', '.join(map(str, task['rows_used']))}")
+        if task.get("columns_used"):
+            lines.append(f"Gold columns: {', '.join(map(str, task['columns_used']))}")
+        lines += [f"Reference explanation: {task['explanation']}", f"Reference final answer: {task['ground_truth']}"]
+        return "\n".join(lines)
+    lines = [header, f"Reference final answer: {task['ground_truth']}"]
     if PVF_CONTEXT == "answer_explanation":
         lines.append(f"Reference explanation: {task['explanation']}")
     return "\n".join(lines)
@@ -430,11 +449,10 @@ def wait_for_publication(steps: int) -> None:
 
 
 def main() -> None:
-    check_reef_source()
     problems = load_problems()
     order = problem_order(problems, BUDGET)
     client = ReefClient(SERVICE_URL, token=TOKEN, timeout_s=CALL_TIMEOUT_S)
-    model = os.environ.get("SAO_MODEL_NAME", "reef")
+    model = ARGS.model_name
     pacer = TrainerPacer(PROGRESS_FILE)
     print(
         f"pool={len(problems)} tasks, budget={BUDGET}, batch={BATCH}, in_flight={IN_FLIGHT}, "
