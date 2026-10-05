@@ -3,7 +3,7 @@
 # server, sequentially, with the c32 protocol of every earlier evaluation: same
 # rllm venv (vllm 0.22.1), same eval_base.py (greedy temp 0, top_p 1, seed 1234,
 # max_tokens 16384, max_model_len 32768), same serve flags, EVAL_CONCURRENCY=32.
-# Defaults: .24 GPU 0 (GPU 1 there is not ours). Every host-specific value can be
+# Defaults: .29 GPU 0, as eval_sao_merged.sh (.24 is no longer used). Every host-specific value can be
 # overridden: EXPECT_IP, GPU, BASE, WORK, NFS (results root), PORT.
 #
 # Multi-adapter successor of eval_sao_checkpoint.sh (which also ran a paired base
@@ -23,7 +23,7 @@ PORT=${PORT:-18041}
 export EVAL_CONCURRENCY=32
 
 DC=/home/yanan/agents/rllm/exp_scripts/deepcoder-run
-EXPECT_IP=${EXPECT_IP:-10.225.68.24}
+EXPECT_IP=${EXPECT_IP:-10.225.68.29}
 BASE=${BASE:-/home/yanan/reef-sao/models/Qwen3-4B-Instruct-2507}   # sha256-identical to the .29 base snapshot
 WORK=${WORK:-/home/yanan/reef-sao-deepcoder/eval}                   # host-local disk: 16 GiB episodes files
 NFS=${NFS:-$(cd "$(dirname "$0")/.." && pwd)/results/deepcoder/eval-c32-lora}

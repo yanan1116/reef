@@ -21,15 +21,15 @@ budget, receipt, assembly-check, drop and retry logic are unchanged. What differ
   receipt in order, so sao_multiturn.MultiTurnSAORecipe assembles the turns into one sample.
 * Failures: an infrastructure error (Reef/engine down, connection, timeout, a 5xx) is retried
   later without reporting, as in the FinQA driver.
-* Synchronous batches (SAO_SYNC_BATCHES=1, the default here; decided 2026-09-30): the driver
-  submits only the episodes one optimizer step needs (reported + in flight <= SAO_BATCH, a dropped
+* Synchronous batches (--sync; every multi-table run since 2026-09-30 passes it): the driver
+  submits only the episodes one optimizer step needs (reported + in flight <= --batch, a dropped
   or failed episode is topped up) and, once the batch is reported, waits for that training step to
   be published before sampling the next batch. Every batch is sampled by one weight version and
-  nothing is in flight at a publication. The streaming mode (0: up to SAO_AHEAD batches ahead of
+  nothing is in flight at a publication. The streaming mode (no --sync: up to --ahead batches ahead of
   the trainer) dropped 41% of multi-table episodes for spanning a publication, with a strong
   length bias (22% at 4-6k tokens, 90% above 12k); single-table streaming dropped 2.9%.
 * Training budget (decided 2026-09-30, so that no episode is dropped): episodes run with
-  multitable_env's token_budget = SAO_MAX_SAMPLE_TOKENS (16384, the single-table training
+  multitable_env's token_budget = --max_sample_tokens (16384, the single-table training
   seq-length). A tool-phase call that would leave less than one 2048-token reply plus a 4096-token
   final answer goes straight to final synthesis ("training_budget"), and final calls are capped,
   so every assembled sample fits and is trained. ~3-4% of episodes (the longest) finalize earlier
@@ -39,33 +39,20 @@ budget, receipt, assembly-check, drop and retry logic are unchanged. What differ
   48 GB card (smoke 2026-09-29 16:39); ~0.8% of episodes are that long. The episode itself
   still runs under the full 49,152-token protocol.
 
-Environment (defaults are the multi-table formal run):
-  SAO_PROBLEMS       data/multi_train.jsonl from export_multitable.py (required)
-  SAO_SCENARIO       Reef scenario (default sao-finqa-multitable)
-  SAO_BATCH          episodes per optimizer step; = recipe batch-size (default 64)
-  SAO_IN_FLIGHT      concurrent episodes (default 64)
-  SAO_BUDGET         reported episodes before the driver stops (default 9600 = 150 steps x 64 = 10 epochs of 991, 15 steps each)
-  SAO_TEMPERATURE, SAO_TOP_P   per-call sampling (0.7, 1.0)
-  SAO_CONTEXT_TOKENS served context (default 49152 = the recipe's context-length and rllm's max_model_len)
-  SAO_MAX_SAMPLE_TOKENS  longest assembled sample reported for training (default 16384)
-  SAO_SYNC_BATCHES   1 (default): sample each batch with one weight version; 0: stream as the FinQA driver
-  SAO_PVF_CONTEXT    privileged value function (arXiv:2608.16739), as finqa_singletable/stream_finqa.py:
-                     "" (default): plain SAO; "answer": the gold answer (multi-table: the reference
-                     analysis, median ~1.4k tokens); "answer_explanation": plus the dataset's explanation.
-  SAO_MODEL_PATH     tokenizer used to count prompt tokens (default the 2507 HF snapshot)
-  SAO_CALL_TIMEOUT_S one model call through Reef (default 1800)
-  SAO_RECORDS_PATH   one JSON line per episode (reported or dropped)
-  SAO_PROGRESS_FILE, SAO_AHEAD, SAO_STALL_S, SAO_SEED, SAO_TRAIN_DRAIN_TIMEOUT_S  as in deepcoder/stream.py
-  FINQA_JUDGE_CREDS  judge credentials file (default exp_scripts/finqa/.judge_creds)
-  FINQA_MULTI_TABLE_JUDGE_MODEL  default gpt-5.4-nano, as in rllm's multi-table training and evaluation
+Settings are command-line flags (--help); the defaults are the multi-table formal run, except
+that experiment switches are off unless passed: --sync (synchronous batches, above) and one of
+--pvf, --pvf_explanation, --pvf_enhanced (privileged value function). FINQA_JUDGE_CREDS (judge
+credentials file, default exp_scripts/finqa/.judge_creds) and FINQA_MULTI_TABLE_JUDGE_MODEL
+(default gpt-5.4-nano, as in rllm's multi-table training and evaluation) stay environment
+variables: the judge module reads them, and the evaluation shares that module.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
-import subprocess
 import sys
 import threading
 import time
@@ -76,6 +63,51 @@ from pathlib import Path
 
 from reef_client import ReefClient, ReefClientError
 from transformers import AutoTokenizer
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Stream FinQA multi-table episodes through Reef for SAO.")
+    parser.add_argument("--problems", required=True, help="data/multi_train.jsonl from export_multitable.py")
+    parser.add_argument("--reef_service_url", default="http://127.0.0.1:8900")
+    parser.add_argument("--scenario", default="sao-finqa-multitable", help="Reef scenario")
+    parser.add_argument("--model_name", default="reef", help="model name sent with each chat request")
+    parser.add_argument("--model_path", help="tokenizer used to count prompt tokens", default=(
+        "/home/yanan/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/"
+        "cdbee75f17c01a7cc42f958dc650907174af0554"))
+    parser.add_argument("--batch", type=int, default=64, help="episodes per optimizer step; = the recipe's batch-size")
+    parser.add_argument("--in_flight", type=int, default=64, help="concurrent episodes")
+    parser.add_argument("--budget", type=int, default=150 * 64,
+                        help="reported episodes before the driver stops (150 steps x 64 = 10 epochs of 991)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="= the recipe's rollout-temperature (the DIS ratio needs them equal)")
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--context_tokens", type=int, default=49152,
+                        help="served context (= the recipe's context-length and rllm's max_model_len)")
+    parser.add_argument("--max_sample_tokens", type=int, default=16384,
+                        help="longest assembled sample reported for training")
+    parser.add_argument("--call_timeout_s", type=float, default=1800, help="one model call through Reef")
+    parser.add_argument("--records_path", default="work/records/finqa_multitable.jsonl",
+                        help="one JSON line per episode (reported or dropped)")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--progress_file", help="the trainer's step counter; --ahead and --stall_s as in deepcoder/stream.py")
+    parser.add_argument("--ahead", type=int, default=3)
+    parser.add_argument("--stall_s", type=int, default=2700)
+    parser.add_argument("--train_drain_timeout_s", type=int, default=14400)
+    parser.add_argument("--sync", action="store_true",
+                        help="sample each batch with one weight version (module docstring); default: stream")
+    # Privileged value function (arXiv:2608.16739): text only the critic reads, sent as the report's
+    # critic_context. The recipe's privileged-value must be on exactly when one of these is passed.
+    pvf = parser.add_mutually_exclusive_group()
+    pvf.add_argument("--pvf", action="store_true",
+                     help="PVF: the critic reads the gold answer (the reference analysis, median ~1.4k tokens)")
+    pvf.add_argument("--pvf_explanation", action="store_true",
+                     help="PVF: the gold answer and the dataset's explanation")
+    pvf.add_argument("--pvf_enhanced", action="store_true",
+                     help="PVF: the gold tables (+ rows/columns), then the explanation and the answer")
+    return parser.parse_args()
+
+
+ARGS = parse_args()
 
 HERE = Path(__file__).resolve().parent
 REEF_ROOT = HERE.parents[1]  # the reef fork checkout the image was built from
@@ -92,34 +124,32 @@ os.environ.setdefault("FINQA_MULTI_TABLE_JUDGE_MODEL", "gpt-5.4-nano")  # before
 load_judge_env()
 from multitable_env import TOOL_SPECS, ChatModel, ModelCallRejected, MultiTableEpisode, grade, run_episode  # noqa: E402
 
-SERVICE_URL = os.environ.get("REEF_SERVICE_URL", "http://127.0.0.1:8900")
+SERVICE_URL = ARGS.reef_service_url
 TOKEN = "reef-local"
-SCENARIO = os.environ.get("SAO_SCENARIO", "sao-finqa-multitable")
+SCENARIO = ARGS.scenario
 RECIPE = "sao"
 
-BATCH = int(os.environ.get("SAO_BATCH", "64"))
-IN_FLIGHT = int(os.environ.get("SAO_IN_FLIGHT", "64"))
-BUDGET = int(os.environ.get("SAO_BUDGET", str(150 * 64)))
-TEMPERATURE = float(os.environ.get("SAO_TEMPERATURE", "0.7"))
-TOP_P = float(os.environ.get("SAO_TOP_P", "1.0"))
-CONTEXT_TOKENS = int(os.environ.get("SAO_CONTEXT_TOKENS", "49152"))
-MAX_SAMPLE_TOKENS = int(os.environ.get("SAO_MAX_SAMPLE_TOKENS", "16384"))
-SYNC_BATCHES = os.environ.get("SAO_SYNC_BATCHES", "1") == "1"
-PVF_CONTEXT = os.environ.get("SAO_PVF_CONTEXT", "")
-PVF_CONTEXTS = ("", "answer", "answer_explanation")
-if PVF_CONTEXT not in PVF_CONTEXTS:
-    raise SystemExit(f"SAO_PVF_CONTEXT must be one of {PVF_CONTEXTS}, got {PVF_CONTEXT!r}")
-MODEL_PATH = os.environ.get(
-    "SAO_MODEL_PATH",
-    "/home/yanan/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554",
-)
-CALL_TIMEOUT_S = float(os.environ.get("SAO_CALL_TIMEOUT_S", "1800"))
-RECORDS_PATH = Path(os.environ.get("SAO_RECORDS_PATH", "work/records/finqa_multitable.jsonl"))
-SEED = int(os.environ.get("SAO_SEED", "0"))
-TRAIN_DRAIN_TIMEOUT_S = int(os.environ.get("SAO_TRAIN_DRAIN_TIMEOUT_S", "14400"))
-PROGRESS_FILE = os.environ.get("SAO_PROGRESS_FILE")
-AHEAD = int(os.environ.get("SAO_AHEAD", "3"))
-STALL_S = int(os.environ.get("SAO_STALL_S", "2700"))
+BATCH = ARGS.batch
+IN_FLIGHT = ARGS.in_flight
+BUDGET = ARGS.budget
+TEMPERATURE = ARGS.temperature
+TOP_P = ARGS.top_p
+CONTEXT_TOKENS = ARGS.context_tokens
+MAX_SAMPLE_TOKENS = ARGS.max_sample_tokens
+SYNC_BATCHES = ARGS.sync
+# The critic_context mode each PVF flag selects; "" is plain SAO.
+PVF_CONTEXT = ("location_explanation_answer" if ARGS.pvf_enhanced
+               else "answer_explanation" if ARGS.pvf_explanation
+               else "answer" if ARGS.pvf
+               else "")
+MODEL_PATH = ARGS.model_path
+CALL_TIMEOUT_S = ARGS.call_timeout_s
+RECORDS_PATH = Path(ARGS.records_path)
+SEED = ARGS.seed
+TRAIN_DRAIN_TIMEOUT_S = ARGS.train_drain_timeout_s
+PROGRESS_FILE = ARGS.progress_file
+AHEAD = ARGS.ahead
+STALL_S = ARGS.stall_s
 REALIGN_THRESHOLD = 1024  # = sao_multiturn.MultiTurnSAORecipe realign_threshold
 SCAFFOLD_TOLERANCE = 0    # = sao_multiturn.MultiTurnSAORecipe scaffold_tolerance
 MAX_FAILURE_STREAK = 24
@@ -144,9 +174,7 @@ class SampleTooLong(RuntimeError):
 
 
 def load_problems() -> list[dict]:
-    path = os.environ.get("SAO_PROBLEMS")
-    if not path:
-        raise SystemExit("SAO_PROBLEMS must point at data/multi_train.jsonl (export_multitable.py)")
+    path = ARGS.problems
     with open(path) as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
     if len(rows) != 991 or any(row.get("split") != "multi_train" for row in rows):
@@ -286,35 +314,27 @@ def turn_versions(record: AgentRecord) -> set[str]:
     return {str(recorded)} if recorded else set()
 
 
-def check_reef_source() -> None:
-    """The assembly imported here must be the image's: the image tag names the Reef source commit."""
-    image = os.environ.get("IMAGE", "")
-    git = ["git", "-C", str(REEF_ROOT), "-c", "safe.directory=*"]
-    commit = subprocess.run([*git, "log", "-1", "--format=%h", "--", ".", ":(exclude)exp_scripts"],
-                            capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run([*git, "status", "--porcelain", "--", ".", ":(exclude)exp_scripts"],
-                           capture_output=True, text=True, check=True).stdout.strip()
-    if image != f"reef:sao-{commit}" or dirty:
-        raise SystemExit(
-            f"expected IMAGE=reef:sao-{commit} and a clean Reef source tree; got IMAGE={image!r}, "
-            f"uncommitted changes: {dirty or 'none'}. The driver checks episodes with Reef's assembly code "
-            f"from {REEF_ROOT}, which must be the code the stack runs: rebuild the image or check out its commit."
-        )
-
-
 def critic_context(task: dict) -> str:
-    """The privileged text the critic reads for ``task`` (SAO_PVF_CONTEXT); empty for plain SAO.
+    """The privileged text the critic reads for ``task`` (--pvf*); empty for plain SAO.
 
     Same wording as the single-table driver. It comes from the dataset, never from the rollout,
     so it is independent of the policy's actions.
     """
     if not PVF_CONTEXT:
         return ""
-    lines = [
-        "Privileged information for estimating how well the assistant will do on this task. "
-        "The assistant never sees it.",
-        f"Reference final answer: {task['ground_truth']}",
-    ]
+    header = ("Privileged information for estimating how well the assistant will do on this task. "
+              "The assistant never sees it.")
+    if PVF_CONTEXT == "location_explanation_answer":
+        # Where the evidence is and how it combines, so the critic can judge each lookup mid-episode, not
+        # only the final answer (2026-10-03). Empty rows/columns (multi-table) are left out.
+        lines = [header, f"Gold tables: {', '.join(task['table_name'])}"]
+        if task.get("rows_used"):
+            lines.append(f"Gold rows: {', '.join(map(str, task['rows_used']))}")
+        if task.get("columns_used"):
+            lines.append(f"Gold columns: {', '.join(map(str, task['columns_used']))}")
+        lines += [f"Reference explanation: {task['explanation']}", f"Reference final answer: {task['ground_truth']}"]
+        return "\n".join(lines)
+    lines = [header, f"Reference final answer: {task['ground_truth']}"]
     if PVF_CONTEXT == "answer_explanation":
         lines.append(f"Reference explanation: {task['explanation']}")
     return "\n".join(lines)
@@ -471,11 +491,10 @@ def wait_for_publication(steps: int) -> None:
 
 
 def main() -> None:
-    check_reef_source()
     problems = load_problems()
     order = problem_order(problems, BUDGET)
     client = ReefClient(SERVICE_URL, token=TOKEN, timeout_s=CALL_TIMEOUT_S)
-    model = os.environ.get("SAO_MODEL_NAME", "reef")
+    model = ARGS.model_name
     pacer = TrainerPacer(PROGRESS_FILE)
     print(
         f"pool={len(problems)} tasks, budget={BUDGET}, batch={BATCH}, in_flight={IN_FLIGHT}, "
