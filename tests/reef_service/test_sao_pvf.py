@@ -93,11 +93,10 @@ def _context(critic_context: str) -> SimpleNamespace:
 
 
 @pytest.mark.unit
-def test_flag_and_context_must_agree() -> None:
+def test_context_is_used_only_when_privileged_value_is_on() -> None:
     assert _processor(False)._critic_context(_context("")) == ""
+    assert _processor(False)._critic_context(_context("ab")) == ""  # off: ignored, as upstream SAO
     assert _processor(True)._critic_context(_context("ab")) == "ab"
-    with pytest.raises(ValueError, match="privileged_value is off"):
-        _processor(False)._critic_context(_context("ab"))
     with pytest.raises(ValueError, match="has no critic_context"):
         _processor(True)._critic_context(_context(" "))
 

@@ -43,8 +43,8 @@ class SAORecipe(WeightTrainingRecipe):
     (arXiv:2608.16739): every report must carry a ``critic_context``, which
     the served model's tokenizer (``tokenizer_path``) renders as a system
     turn that only the critic reads, before the sample. The actor's sample,
-    the DIS ratio, the loss and the GAE are unchanged; off, a report carrying
-    a context is rejected, so the flag alone decides which arm a run is.
+    the DIS ratio, the loss and the GAE are unchanged. Off (the default), the
+    recipe is upstream SAO: a report's ``critic_context`` is ignored.
     """
 
     name: str = "sao"
