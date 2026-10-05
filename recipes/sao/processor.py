@@ -72,19 +72,18 @@ class SAOProcessor(ReportedFeedbackProcessor):
         return sample
 
     def _critic_context(self, context: ReportContext) -> str:
-        """The report's privileged critic text; required exactly when the recipe has ``privileged_value``."""
+        """The report's privileged critic text, required on every report when the recipe has ``privileged_value``.
+
+        Off, the field is ignored like any other extra metadata key, exactly as upstream SAO does.
+        """
+        if not self._privileged_value:
+            return ""
         parsed = context.parsed_report
         critic_context = parsed.critic_context if isinstance(parsed, SAOReport) else ""
-        report_id = context.report.agent_record_id
-        if self._privileged_value and not critic_context.strip():
+        if not critic_context.strip():
             raise ValueError(
-                f"report {report_id} has no critic_context, but the recipe's privileged_value critic needs one "
-                "on every report; send metadata.critic_context or turn privileged_value off"
-            )
-        if not self._privileged_value and critic_context:
-            raise ValueError(
-                f"report {report_id} carries a critic_context, but the recipe's privileged_value is off, so the "
-                "critic would silently ignore it; turn privileged_value on or stop sending the context"
+                f"report {context.report.agent_record_id} has no critic_context, but the recipe's privileged_value "
+                "critic needs one on every report; send metadata.critic_context or turn privileged_value off"
             )
         return critic_context
 
