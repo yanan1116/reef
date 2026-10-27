@@ -1,0 +1,5 @@
+{
+  "description": "Errors-only variant (user, 2026-10-24): ECHO predicts only AppWorld's execution errors (tool responses that start with 'Execution failed.', the traceback of the policy's code), the clearest consequence of an action; API documentation, data, printed values and harness messages are left out.",
+  "keep_response_prefixes": ["Execution failed."],
+  "drop_response_suffixes": ["[truncated]"]
+}

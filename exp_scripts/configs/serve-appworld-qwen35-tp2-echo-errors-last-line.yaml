@@ -1,0 +1,231 @@
+# errors-only-last-line ECHO arm (user, 2026-10-25): identical to serve-appworld-qwen35-tp2-echo-errors.yaml except
+# sao-echo-rules, which also keeps only the last line of each error (the exception or API error message), without the
+# quoted source code and frame lines of the traceback (about 26% of errors-only's ECHO tokens).
+# Errors-only ECHO arm (user, 2026-10-24: ECHO on execution errors only, after the held-out CE check showed ECHO's
+# observation CE falls on held-out tasks too): identical to serve-appworld-qwen35-tp2-echo-nodocs-fixed.yaml except
+# sao-echo-rules, which keeps only tool responses that start with "Execution failed." (AppWorld's traceback output).
+# Fixed-weight rerun of the ECHO-source arm (user, 2026-10-24: "固定一个小系数（如 0.0025）不随 CE 上升"): identical to
+# serve-appworld-qwen35-tp2-echo-nodocs.yaml except the ECHO weight, which is a constant 0.0025 (no sao-echo-target-ratio),
+# so it no longer grows as echo_ce falls. Printed output and "Execution successful." stay in the cross-entropy.
+# ECHO-source arm (user, 2026-10-23: "只使用 env response 比如报错信息等等来作为 ce loss，而不包括 api 查询的文档信息"):
+# identical to serve-appworld-qwen35-tp2-echo.yaml except sao-echo-rules, which also skips every tool response whose
+# action called apis.api_docs. The pair compares where ECHO's cross-entropy comes from; the code and weights are the same.
+# ECHO arm of serve-appworld-qwen35-tp2.yaml (user, 2026-10-23): identical except the four sao-echo-* lines below, which add
+# ECHO's environment-observation cross-entropy to the SAO actor loss (recipes/sao/slime/echo.py).
+# Needs STACK_SAO_ECHO=1 (scripts/start_stack.sh mounts the ECHO recipe files over the same image).
+# TP2 colocated variant of serve-appworld-qwen35-2gpu.yaml for .16 (2x RTX 6000 Ada 48 GB), 2026-10-09.
+# Why: the 2-GPU layout (SGLang on one GPU, actor+critic on the other) OOMed at the first actor step
+# on a ~26k-token sample (smoke 2026-10-09 22:45, slime vocab_parallel_softmax, 46 of 47.4 GB): Slime
+# materializes [T, 248320] logits plus each chunk's fp32 softmax for backward on the actor's GPU.
+# Here the actor and the critic run tensor-parallel over both GPUs (TP2 + sequence parallel), so
+# each GPU holds half the vocabulary (Megatron parallel_output=True; Slime's softmax all-reduces
+# over the TP group): about 8 GB of logits + 16 GB of saved softmax per GPU for a 32k sample, plus
+# half of each base. SGLang runs one TP1 engine per GPU (colocated LoRA sync requires one GPU per
+# engine) and releases its memory while the actor/critic train, which the driver's --sync batches
+# need anyway. Everything else is the 2-GPU config's: model, Qwen3.5 spec, attention auto (+ the TE
+# FA2 patch), batch, LoRA, objective, sampling, sequence window.
+#
+# SAO (arXiv:2607.07508) on AppWorld (react_code protocol), Qwen3.5-4B, colocated,
+# synchronous batches. serve-appworld-2507.yaml with only what the model, the GPU budget and the
+# synchronous protocol force changed:
+#
+#  1. Model: Qwen3.5-4B @ 851bf6e8 with the eos fix (generation_config names <|im_end|> 248046;
+#     the snapshot has none), copied as real files into ~/reef-sao/models (start_stack.sh mount).
+#  2. Architecture: Slime's Qwen3.5 hybrid spec (Gated DeltaNet + gated attention), the flags of
+#     recipes/sao/examples/ceobench/serve.yaml; sizes come from the HF config through the bridge.
+#     Vocabulary 248320, rope theta 1e7 with partial rotary 0.25, tied embeddings (the 4B ties).
+#  3. Attention: auto. TE 2.16.1 excludes FlashAttention-2 above head_dim 192 on sm89, a stale rule
+#     (flash_attn 2.8.3 runs head_dim 256 fwd+bwd there). Launch with STACK_TE_FA2_SM89_HDIM256=1
+#     (exp_scripts/patches/te-2.16.1-fa2-sm89-hdim256) and auto selects FlashAttention-2 (32k tokens
+#     fwd+bwd in 2.3 GiB, probed 2026-10-08); without it, auto falls to Unfused, whose S x S scores
+#     cap the sample near 12k on one 48 GB GPU.
+#  4. Engine: tool parser qwen3_coder (Qwen3.5's XML tool format). No reasoning parser: thinking
+#     is off per request (driver --no_think); a reasoning parser plus forced no-think returns
+#     content=None.
+#  5. Placement: training.colocate true and num-gpus-per-node 1 (serve-finqa-2507-dot29-colocate.yaml):
+#     SGLang releases its memory while the actor/critic train; launch with --sync. Launch with
+#     STACK_NETWORK=private (own network namespace), so its Ray never meets a host Ray's ports.
+#  6. 15 tasks per step, one rollout each (train90: 6 steps per epoch), the rLLM PRPO AppWorld
+#     batch; a durable Reef version every 6 steps (one epoch).
+#
+# The objective, LoRA, sampling (T=1.0, top_p 1.0) and sequence window are unchanged.
+schema-version: 2
+reef:
+  host: 0.0.0.0                        # STACK_NETWORK=private: Reef is reached through the published port
+  port: 8900
+  token: reef-local
+  run-dir: /var/lib/reef/stack
+  ready-timeout: 3600
+
+inference:
+  model-path: /root/models/qwen35-4b-851bf6e8-eosfix
+  num-gpus: "2"                      # one TP1 SGLang engine per GPU, colocated with training
+  tensor-parallel-size: "1"
+  timeout-s: 7200
+  retry-timeout-s: 7200                # upstream serve-30b: requests survive an engine restart
+  retry-max-s: 60
+  options:
+    router-port: "30000"
+    context-length: "32768"          # measured 2507 AppWorld episodes up to 19.7k tokens
+    # --- upstream serve-30b.yaml ---
+    disable-radix-cache: true          # "Required by Reef's SGLang inference backend (#432)"
+    incremental-streaming-output: true
+    mem-fraction-static: "0.7"
+    chunked-prefill-size: "4096"
+    max-running-requests: "16"
+    # --- ours ---
+    watchdog-timeout: "1800"
+    tool-call-parser: "qwen3_coder"         # Qwen3-2507 <tool_call>{json}</tool_call> (vLLM: hermes)
+  handler-factory: reef.inference.sglang.chat.SGLangInferenceHandler
+  handler-config:
+    tool_call_parser: qwen3_coder
+    # Thinking is off per request (driver --no_think), but Reef sniffs the default template, which
+    # ends with an open <think>, and would file every reply under reasoning_content (smoke
+    # 2026-10-08: correct tool calls, empty content). The explicit value wins over the sniff.
+    force_reasoning: false
+
+recipe:
+  implementation: sao_multiturn:MultiTurnSAORecipe   # exp_scripts/finqa, on the container PYTHONPATH
+  config:
+    batch-size: 15                     # 15 tasks per step (train90: 6 steps/epoch); MUST equal global_batch_size and SAO_BATCH
+    max-staleness: 18
+    checkpoint-every-n-versions: 2     # a third of an epoch (user, 2026-10-09): 15 of 90 tasks per step = 6 steps/epoch
+    accept-multi-turn-policy-samples: true   # one episode = one sample (skip-observation GAE)
+
+training:
+  backend: slime
+  colocate: true                       # SGLang and actor/critic share both GPUs (--sync)
+  ready-timeout: 1800
+  timeout-s: 14400
+  config:
+    checkpoint_dir: /var/lib/reef/checkpoints
+    global_batch_size: 15
+  options:
+    megatron-to-hf-mode: "bridge"
+    hf-checkpoint: "${inference.model-path}"
+    load: "${training.config.checkpoint_dir}/megatron"
+    save: "${training.config.checkpoint_dir}/megatron"
+    save-interval: "100"
+    save-hf: "${training.config.checkpoint_dir}/hf/{rollout_id}"
+    num-rollout: "100000000"
+    rollout-batch-size: "${training.config.global_batch_size}"
+    global-batch-size: "${training.config.global_batch_size}"
+    micro-batch-size: "1"
+
+    # --- topology: actor + critic TP2 over both GPUs, SGLang colocated (one engine per GPU) ---
+    actor-num-nodes: "1"
+    actor-num-gpus-per-node: "2"
+    num-gpus-per-node: "2"
+    tensor-model-parallel-size: "2"
+    pipeline-model-parallel-size: "1"
+
+    # --- Qwen3-4B-Instruct-2507 architecture: slime scripts/models/qwen3-4B-Instruct-2507.sh ---
+    # Only the flags Reef cannot derive from the HF config.
+    disable-bias-linear: true
+    qk-layernorm: true
+    group-query-attention: true
+    normalization: "RMSNorm"
+    position-embedding-type: "rope"
+    swiglu: true
+    padded-vocab-size: "248320"
+    rotary-base: "10000000"
+    spec:
+      - slime_plugins.models.qwen3_5
+      - get_qwen3_5_spec
+    use-gated-attention: true
+    attention-output-gate: true
+    apply-layernorm-1p: true
+    rotary-percent: "0.25"
+    # auto: FlashAttention-2 with STACK_TE_FA2_SM89_HDIM256=1, else Unfused (header note 3).
+    # "flash" fails outright without the patch (smoke 2026-10-08).
+    attention-backend: "auto"
+
+    # --- LoRA (memory-forced; values from the ceobench SAO config) ---
+    megatron-lora-rank: "32"
+    megatron-lora-alpha: "32"
+    megatron-lora-dropout: "0"
+    megatron-lora-target-modules:
+      - linear_qkv
+      - linear_proj
+      - linear_fc1
+      - linear_fc2
+    # 3 engine adapter slots (Reef docs, evolve-your-model.rst: one per scenario
+    # plus one for the revision being published). The default 1 deadlocked the
+    # step-2 publication: evicting adapter :1 to load :2 waited on the 127
+    # requests still pinned to :1, which the in-place pause had frozen, and the
+    # unload hit its 600 s timeout (run 2026-09-23 17:43, 22:07:54Z). It also
+    # sets max-loras-per-batch, so old- and new-revision requests batch together
+    # instead of draining the engine to one running request before each publish.
+    max-loaded-loras: "3"
+    check-lora-weight-equal: true
+    verify-lora-base-weights: true
+    # --no-offload-train is deliberately NOT set: on one 48 GB card the actor
+    # and the colocated critic cannot both stay resident, and leaving it off
+    # lets Slime offload whichever is idle between critic and actor steps.
+
+    # --- sequence window ---
+    # DeepCoder completions from this model: mean 2,171 tokens in the GRPO
+    # run; the eval protocol allows 16,384. The response cap here keeps the
+    # training step's memory bounded; the driver's SAO_MAX_TOKENS must not
+    # exceed it.
+    seq-length: "32768"
+    rollout-max-response-len: "32768"  # Slime metrics only; the driver sets max_tokens per call
+    rollout-max-context-len: "32768"   # = context-length
+    recompute-granularity: "full"
+    recompute-method: "uniform"
+    recompute-num-layers: "1"
+    log-probs-chunk-size: "1024"
+    use-dynamic-batch-size: true
+    max-tokens-per-gpu: "16384"   # = FinQA (48 GB .16); a longer single sample gets a micro-batch of its own
+    sequence-parallel: true            # with TP2: activations split along the sequence (hf_attention handles GDN)
+    # Offload swap plus a checkpoint save per step can starve SGLang's health
+    # endpoint past the 30 s default (observed on the IMO attempt).
+    rollout-health-check-timeout: "1200"
+    # Rolling window of ~15 bundles; see note 6 in the header.
+    reef-checkpoint-max-storage: "400GB"
+    reef-checkpoint-adapter-only: true
+    attention-dropout: "0.0"
+    hidden-dropout: "0.0"
+    attention-softmax-in-fp32: true
+    accumulate-allreduce-grads-in-fp32: true
+
+    # --- OBJECTIVE: upstream imo_answerbench values, unchanged except the
+    #     two LoRA learning rates (10x, keeping the paper's 5:1 critic ratio) ---
+    optimizer: "adam"
+    lr: "1e-5"                         # upstream full-param: 1e-6
+    lr-decay-style: "constant"
+    loss-type: "policy_loss"
+    use-rollout-logprobs: true
+    use-critic: true
+    eps-clip: "0.3"
+    eps-clip-high: "5.0"
+    critic-steps-per-actor: "2"
+    critic-lr: "5e-5"                  # upstream full-param: 5e-6
+    num-critic-only-steps: "10"
+    sao-length-adaptive-lambda: true
+    sao-lambda-alpha: "1.5"
+    # ECHO weight (arXiv:2605.24517). Qwen3.5-4B's cross-entropy on AppWorld tool output starts near 6.3 nats/token
+    # (vLLM prompt log-probs; smoke echo_ce 6.9-7.6) against ~0.29 for the paper's Qwen3-8B, and it falls as it is
+    # learned, so a fixed weight first outweighs SAO's policy loss and later fades out. The weight adapts instead
+    # (user, 2026-10-23: ECHO's share at 15-20%): ratio * EMA|pg_loss| / EMA(echo_ce), capped at the paper's 0.05.
+    sao-echo-coef: "0.0025"            # constant weight (and the level-1 switch: 0 = plain SAO)
+    sao-echo-span: tool                # cross-entropy on text inside <tool_response> blocks only
+    sao-echo-rules: /repro/appworld/echo_rules_errors_last_line.json   # last line of execution errors only
+    gamma: "1.0"
+    lambd: "1.0"
+    entropy-coef: "0.0"
+    n-samples-per-prompt: "1"
+    rollout-temperature: "1.0"         # = grpo_vanilla AppWorld line; must match the driver's SAO_TEMPERATURE
+
+storage:
+  artifact-repository: /var/lib/reef/artifacts.git
+  artifact-work-dir: /var/lib/reef/artifact-work
+  artifact-cache-dir: /var/lib/reef/artifact-cache
+  agent-record-dir: /var/lib/reef/agent-record
+
+observability:
+  wandb:
+    enabled: false
+    project: reef-sao-appworld-qwen35-tp2
+    mode: offline
+    directory: /var/lib/reef/wandb

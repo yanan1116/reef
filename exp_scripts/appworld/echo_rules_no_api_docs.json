@@ -1,0 +1,6 @@
+{
+  "description": "Variant (not in the paper): the paper-faithful AppWorld rules plus skipping every tool response whose action called apis.api_docs, i.e. static API documentation rather than the consequence of an action (about 55% of AppWorld observation text in the 2026-10-09 SAO run).",
+  "skip_after_action": ["api_docs"],
+  "skip_response_prefixes": ["{\"error\": "],
+  "drop_response_suffixes": ["[truncated]"]
+}

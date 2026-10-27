@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reef-sao-skilllearnbench-harness"
+version = "0.1.0"
+description = "A minimal bash agent for SkillLearnBench Harbor tasks, served by Reef and scored by the task verifier"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+    "openai",
+    "reef-client",
+    "reef-eval[harbor]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harness*"]

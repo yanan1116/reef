@@ -1,0 +1,5 @@
+{
+  "description": "AppWorld ECHO rules, as in the paper (arXiv:2605.24517, Section 3.2: env_only): leave out tool-response text that appworld_react/episode.py writes itself, not the AppWorld environment. The interaction-budget message and a failed /execute dispatch are JSON objects that start with {\"error\": (AppWorld's own failures arrive as 'Execution failed. Traceback: ...'); outputs over 60000 characters end with the harness's '[truncated]' line. API documentation outputs are kept, as the paper keeps every terminal output.",
+  "skip_response_prefixes": ["{\"error\": "],
+  "drop_response_suffixes": ["[truncated]"]
+}

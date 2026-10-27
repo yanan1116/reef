@@ -136,6 +136,18 @@ def get_skip_observation_advantages_and_returns(
     return advantages.detach(), returns
 
 
+@objective("reef_actor_init_hook_path")
+def sao_actor_init(actor: Any) -> None:
+    """Install ECHO's observation cross-entropy in the actor when ``--sao-echo-coef`` is positive.
+
+    With the default 0 nothing is installed, and the actor's loss is SAO's exactly. See ``recipes.sao.slime.echo``.
+    """
+    if getattr(actor.args, "sao_echo_coef", 0.0) > 0:
+        from recipes.sao.slime.echo import install_echo
+
+        install_echo(actor.args)
+
+
 @objective("custom_advantage_function_path")
 def sao_advantages(args: Namespace, rollout_data: dict[str, Any]) -> None:
     """Populate SAO advantages/returns via Slime's custom-advantage hook.

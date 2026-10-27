@@ -84,9 +84,36 @@ fi
 # stack beside it (colocated training offloads optimizer state to host RAM: ~45 GB per 4B stack on .29).
 MEM_ARGS=()
 if [ -n "${STACK_MEMORY:-}" ]; then MEM_ARGS=(--memory "$STACK_MEMORY"); fi
+# Optional: STACK_TE_FA2_SM89_HDIM256=1 mounts patches/te-2.16.1-fa2-sm89-hdim256/utils.py over the
+# image's TransformerEngine attention utils, so FlashAttention-2 serves head_dim 256 on sm89 (Qwen3.5).
+# The image's original must match the sha256 the patch was made from; unset, nothing changes.
+PATCH_ARGS=()
+if [ "${STACK_TE_FA2_SM89_HDIM256:-0}" = 1 ]; then
+  TE_UTILS=/usr/local/lib/python3.12/dist-packages/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+  TE_UTILS_SHA=025db641f10b6a21e480840ccf059c979af2deac80b59fcad4aef7a73edbe038
+  found=$(docker run --rm --entrypoint sha256sum "$IMAGE" "$TE_UTILS" 2>/dev/null | awk '{print $1}')
+  [ "$found" = "$TE_UTILS_SHA" ] || { echo "STACK_TE_FA2_SM89_HDIM256=1: $IMAGE's $TE_UTILS has sha256 '$found', the patch was made from $TE_UTILS_SHA" >&2; exit 1; }
+  PATCH_ARGS=(-v "$REPRO/patches/te-2.16.1-fa2-sm89-hdim256/utils.py:$TE_UTILS:ro")
+fi
+# Optional: STACK_SAO_ECHO=1 mounts this checkout's recipes/sao/slime/{__init__,objective,echo}.py over the image's
+# SAO package, which adds the --sao-echo-coef switch (ECHO, recipes/sao/slime/echo.py; user, 2026-10-23). The image
+# and its other code stay as they are. The image's two originals must be sao 76fb540e's (the reef:sao-76fb540e
+# image), the version these files extend; unset, nothing is mounted and the image's SAO runs unchanged.
+if [ "${STACK_SAO_ECHO:-0}" = 1 ]; then
+  SAO_SLIME=/workspace/Reef/recipes/sao/slime
+  for pair in "__init__.py a7db5f75e1b34ff013a8d1f72ee4d60de237ee53bb7ef1d266b61ed66a4045cf" \
+              "objective.py 5f5bbae8bc9570a145429c5b7aecc152d978f2843d60e4118a5c1af370a9b5d1"; do
+    read -r file sha <<< "$pair"
+    found=$(docker run --rm --entrypoint sha256sum "$IMAGE" "$SAO_SLIME/$file" 2>/dev/null | awk '{print $1}')
+    [ "$found" = "$sha" ] || { echo "STACK_SAO_ECHO=1: $IMAGE's $SAO_SLIME/$file has sha256 '$found', ECHO extends $sha (sao 76fb540e)" >&2; exit 1; }
+  done
+  for file in __init__.py objective.py echo.py; do
+    PATCH_ARGS+=(-v "$REPRO/../recipes/sao/slime/$file:$SAO_SLIME/$file:ro")
+  done
+fi
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
-docker run -d --name "$NAME" "${RUNTIME_ARGS[@]}" \
+docker run -d --name "$NAME" "${RUNTIME_ARGS[@]}" "${PATCH_ARGS[@]}" \
   "${GPU_ARGS[@]}" "${NET_ARGS[@]}" "${MEM_ARGS[@]}" \
   -v /home/yanan/reef-sao/models:/root/models \
   -v "$STATE_DIR":/var/lib/reef \

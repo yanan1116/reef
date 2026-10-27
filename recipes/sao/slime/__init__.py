@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from argparse import Namespace
 from collections.abc import Mapping, Sequence
@@ -22,6 +23,9 @@ DEFAULT_LAMBDA_ALPHA = 1.5
 # Paper: value targets use lambda=1 (Monte-Carlo returns) while the policy's
 # advantages may use the length-adaptive lambda (arXiv:2607.07508, Section 4).
 DEFAULT_CRITIC_LAMBDA = 1.0
+# Which non-action tokens ECHO predicts: the text inside <tool_response> blocks, or every non-action token.
+DEFAULT_ECHO_SPAN = "tool"
+ECHO_SPANS = ("tool", "all")
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,14 @@ class SaoSettings:
     length_adaptive_lambda: bool = False
     lambda_alpha: float = DEFAULT_LAMBDA_ALPHA
     critic_lambda: float = DEFAULT_CRITIC_LAMBDA
+    # ECHO (arXiv:2605.24517): weight of the actor's environment-observation cross-entropy; 0 leaves SAO unchanged.
+    echo_coef: float = 0.0
+    echo_span: str = DEFAULT_ECHO_SPAN
+    # JSON file naming harness-written tool-response text ECHO leaves out (recipes/sao/slime/echo.py EchoRules).
+    echo_rules: str | None = None
+    # Adaptive weight: keep the ECHO term at this fraction of SAO's policy loss (0 = the fixed coef); coef is the cap.
+    echo_target_ratio: float = 0.0
+    echo_ema: float = 0.9
 
 
 @register_loss_family
@@ -139,6 +151,29 @@ class SaoAlgorithm(SlimeAlgorithm):
         ):
             raise RuntimeError(f"{source} requires --sao-critic-lambda in [0, 1]")
 
+        echo_coef = getattr(args, "sao_echo_coef", 0.0)
+        if not isinstance(echo_coef, Real) or isinstance(echo_coef, bool) or not 0 <= float(echo_coef) < float("inf"):
+            raise RuntimeError(f"{source} requires --sao-echo-coef >= 0")
+        if echo_coef > 0:
+            if getattr(args, "sao_echo_span", DEFAULT_ECHO_SPAN) not in ECHO_SPANS:
+                raise RuntimeError(f"{source} requires --sao-echo-span in {ECHO_SPANS}")
+            ratio = getattr(args, "sao_echo_target_ratio", 0.0)
+            if not isinstance(ratio, Real) or isinstance(ratio, bool) or not 0 <= float(ratio) < 1:
+                raise RuntimeError(f"{source} requires --sao-echo-target-ratio in [0, 1)")
+            ema = getattr(args, "sao_echo_ema", 0.9)
+            if not isinstance(ema, Real) or isinstance(ema, bool) or not 0 <= float(ema) < 1:
+                raise RuntimeError(f"{source} requires --sao-echo-ema in [0, 1)")
+            rules = getattr(args, "sao_echo_rules", None)
+            if rules and not os.path.isfile(rules):
+                raise RuntimeError(f"{source}: --sao-echo-rules {rules} is not a file")
+            # ECHO reads whole-sample tokens next to locally sliced log-probs; context parallelism would split them.
+            if (getattr(args, "context_parallel_size", 1) or 1) > 1:
+                raise RuntimeError(f"{source}: --sao-echo-coef needs --context-parallel-size 1")
+            if getattr(args, "loss_type", "policy_loss") != "policy_loss":
+                raise RuntimeError(
+                    f"{source}: --sao-echo-coef extends the policy loss; --loss-type must be policy_loss"
+                )
+
     def parse_specific_options(self, arguments: Sequence[str]) -> tuple[SaoSettings, list[str]]:
         parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS)
         parser.add_argument(
@@ -166,6 +201,48 @@ class SaoAlgorithm(SlimeAlgorithm):
                 f"(arXiv:2607.07508). Default {DEFAULT_CRITIC_LAMBDA}."
             ),
         )
+        parser.add_argument(
+            "--sao-echo-coef",
+            dest="echo_coef",
+            type=float,
+            help=(
+                "Weight of ECHO's environment-observation cross-entropy added to the actor loss "
+                "(arXiv:2605.24517; the paper uses 0.05). Default 0: off, SAO unchanged. "
+                "The critic and GAE never see it."
+            ),
+        )
+        parser.add_argument(
+            "--sao-echo-span",
+            dest="echo_span",
+            choices=ECHO_SPANS,
+            help=(
+                "Observation tokens ECHO predicts: 'tool' (default) the text inside <tool_response> blocks, "
+                "'all' every non-action token after the first prompt."
+            ),
+        )
+        parser.add_argument(
+            "--sao-echo-rules",
+            dest="echo_rules",
+            help=(
+                "JSON file of tool-response text ECHO leaves out because the harness, not the environment, wrote it "
+                "(keys skip_after_action, skip_response_prefixes, drop_response_suffixes). Default: none."
+            ),
+        )
+        parser.add_argument(
+            "--sao-echo-target-ratio",
+            dest="echo_target_ratio",
+            type=float,
+            help=(
+                "Keep the ECHO term at this fraction of SAO's |policy loss| by adapting its weight each micro-batch "
+                "(ratio * EMA|pg_loss| / EMA echo_ce, capped at --sao-echo-coef). Default 0: the fixed --sao-echo-coef."
+            ),
+        )
+        parser.add_argument(
+            "--sao-echo-ema",
+            dest="echo_ema",
+            type=float,
+            help="EMA decay of the |pg_loss| and echo_ce averages behind --sao-echo-target-ratio. Default 0.9.",
+        )
         options, remaining = parser.parse_known_args(list(arguments))
         return SaoSettings(**vars(options)), remaining
 
@@ -175,6 +252,11 @@ class SaoAlgorithm(SlimeAlgorithm):
         args.sao_length_adaptive_lambda = settings.length_adaptive_lambda
         args.sao_lambda_alpha = settings.lambda_alpha
         args.sao_critic_lambda = settings.critic_lambda
+        args.sao_echo_coef = settings.echo_coef
+        args.sao_echo_span = settings.echo_span
+        args.sao_echo_rules = settings.echo_rules
+        args.sao_echo_target_ratio = settings.echo_target_ratio
+        args.sao_echo_ema = settings.echo_ema
 
     # --- stage 2: shape row ---
 

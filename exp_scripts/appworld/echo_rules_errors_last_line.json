@@ -1,0 +1,6 @@
+{
+  "description": "Errors-only, last line (user, 2026-10-25: errors-only-last-line): ECHO predicts only the final line of AppWorld's execution errors (tool responses that start with 'Execution failed.'), i.e. the exception or API error message, without the quoted source code, caret markers and frame lines of the traceback.",
+  "keep_response_prefixes": ["Execution failed."],
+  "drop_response_suffixes": ["[truncated]"],
+  "keep_last_line": true
+}

@@ -41,16 +41,27 @@ Environment (defaults are the AppWorld formal run):
   APPWORLD_ROOT, APPWORLD_VENV, APPWORLD_PORT_BASE   AppWorld checkout, its venv, first server port (7800)
   SAO_RECORDS_PATH, SAO_EPISODES_PATH   one JSON line per episode: summary / full conversation
   SAO_PROGRESS_FILE, SAO_AHEAD, SAO_STALL_S, SAO_SEED, SAO_TRAIN_DRAIN_TIMEOUT_S  as in the FinQA driver
+
+Experiment switches (command-line flags, off unless passed; off = the behaviour above):
+  --sync      synchronous batches, the FinQA drivers' barrier: only one optimizer step's episodes
+              are sampled (reported + in flight <= SAO_BATCH, failed or dropped ones topped up),
+              and the next batch waits until that step is published, so every batch comes from
+              one weight version and nothing is in flight at a publication. Required with a
+              colocated config (one GPU takes turns sampling and training).
+  --no_think  Qwen3.5-family policies: every request carries chat_template_kwargs
+              {"enable_thinking": false}, and the local prompt count renders the same way Reef
+              does (thinking off, tool-call arguments as JSON objects, as Reef's
+              _template_messages normalizes them; Qwen3.5's template rejects string arguments).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import queue as queue_module
 import random
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -73,6 +84,20 @@ from transformers import AutoTokenizer  # noqa: E402
 from appworld_react.episode import (  # noqa: E402
     AppWorldServer, ChatModel, ContextOverflow, Episode, run_episode,
 )
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SAO on AppWorld through Reef (settings: SAO_* environment, see module docstring)")
+    parser.add_argument("--sync", action="store_true",
+                        help="sample each batch with one weight version (module docstring); default: stream")
+    parser.add_argument("--no_think", action="store_true",
+                        help="Qwen3.5-family: thinking off per request, local prompt count rendered as Reef renders it")
+    return parser.parse_args()
+
+
+ARGS = parse_args()
+SYNC_BATCHES = ARGS.sync
+NO_THINK = ARGS.no_think
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 SERVICE_URL = "http://127.0.0.1:8900"
 TOKEN = "reef-local"
@@ -186,6 +211,27 @@ def response_runtime_load_id(body: dict) -> str | None:
     return None
 
 
+def template_view(messages: list[dict]) -> list[dict]:
+    """Messages as Reef renders them (inference/chat.py _template_messages): tool-call arguments as objects."""
+    view = []
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            view.append(message)
+            continue
+        normalized = []
+        for call in calls:
+            function = dict(call.get("function") or {})
+            if isinstance(function.get("arguments"), str):
+                try:
+                    function["arguments"] = json.loads(function["arguments"])
+                except json.JSONDecodeError:
+                    pass  # Reef rejects such a request; the engine's error ends the episode as before
+            normalized.append({**call, "function": function})
+        view.append({**message, "tool_calls": normalized})
+    return view
+
+
 class ReefChat(ChatModel):
     """One AppWorld call through Reef: T=1.0 / top_p 1.0, the execute_code tool, one receipt per call."""
 
@@ -195,8 +241,12 @@ class ReefChat(ChatModel):
 
     def complete(self, messages: list[dict], tools: list[dict], max_tokens: int) -> tuple[dict, dict]:
         # transformers 5 returns a BatchEncoding here, whose len() is its number of keys: count input_ids.
-        encoded = tokenizer.apply_chat_template(messages, tools=tools, add_generation_prompt=True, tokenize=True,
-                                                return_dict=True)
+        if NO_THINK:
+            encoded = tokenizer.apply_chat_template(template_view(messages), tools=tools, add_generation_prompt=True,
+                                                    tokenize=True, return_dict=True, **CHAT_TEMPLATE_KWARGS)
+        else:
+            encoded = tokenizer.apply_chat_template(messages, tools=tools, add_generation_prompt=True, tokenize=True,
+                                                    return_dict=True)
         prompt_tokens = len(encoded["input_ids"])
         room = CONTEXT_TOKENS - prompt_tokens - CONTEXT_MARGIN
         if room <= 0:
@@ -209,6 +259,8 @@ class ReefChat(ChatModel):
             "top_p": TOP_P,
             "max_tokens": min(max_tokens, room),
         }
+        if NO_THINK:
+            payload["chat_template_kwargs"] = CHAT_TEMPLATE_KWARGS
         try:
             body, receipt = self.client.inference_with_record(SCENARIO, "/v1/chat/completions", payload)
         except ReefClientError as error:
@@ -257,22 +309,6 @@ def turn_versions(record: AgentRecord) -> set[str]:
         return {str(span["runtime_load_id"]) for span in spans}
     recorded = record.payload.get("runtime_load_id") or training.get("runtime_load_id")
     return {str(recorded)} if recorded else set()
-
-
-def check_reef_source() -> None:
-    """The assembly imported here must be the image's: the image tag names the Reef source commit."""
-    image = os.environ.get("IMAGE", "")
-    git = ["git", "-C", str(REEF_ROOT), "-c", "safe.directory=*"]
-    commit = subprocess.run([*git, "log", "-1", "--format=%h", "--", ".", ":(exclude)exp_scripts"],
-                            capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run([*git, "status", "--porcelain", "--", ".", ":(exclude)exp_scripts"],
-                           capture_output=True, text=True, check=True).stdout.strip()
-    if image != f"reef:sao-{commit}" or dirty:
-        raise SystemExit(
-            f"expected IMAGE=reef:sao-{commit} and a clean Reef source tree; got IMAGE={image!r}, "
-            f"uncommitted changes: {dirty or 'none'}. The driver checks episodes with Reef's assembly code "
-            f"from {REEF_ROOT}, which must be the code the stack runs: rebuild the image or check out its commit."
-        )
 
 
 def play(client: ReefClient, model: str, task_id: str, position: int) -> Episode:
@@ -415,8 +451,24 @@ def wait_for_training(expected: int) -> None:
     print(f"WARNING: only {trained}/{expected} steps trained within {TRAIN_DRAIN_TIMEOUT_S}s", flush=True)
 
 
+def wait_for_publication(steps: int) -> None:
+    """Block until ``steps`` training releases exist: the batch just reported has been trained and published."""
+    if steps == 0:
+        # The first batch samples the base; the scenario only exists once its first request arrives,
+        # so asking for its releases before that returns 404 (multi-table sync run, 2026-09-30).
+        return
+    started = time.time()
+    while True:
+        trained = training_release_count()
+        if trained is not None and trained >= steps:
+            print(f"sync: step {steps} published after {time.time() - started:.0f}s; sampling batch {steps + 1}", flush=True)
+            return
+        if time.time() - started > TRAIN_DRAIN_TIMEOUT_S:
+            raise SystemExit(f"sync: step {steps} not published within {TRAIN_DRAIN_TIMEOUT_S}s (trained={trained})")
+        time.sleep(15)
+
+
 def main() -> None:
-    check_reef_source()
     if not (APPWORLD_VENV / "bin" / "appworld").is_file():
         raise SystemExit(f"expected the AppWorld CLI at {APPWORLD_VENV}/bin/appworld (APPWORLD_VENV)")
     problems = load_problems()
@@ -428,7 +480,8 @@ def main() -> None:
     pacer = TrainerPacer(PROGRESS_FILE)
     print(
         f"pool={len(problems)} tasks, budget={BUDGET}, batch={BATCH}, in_flight={IN_FLIGHT}, "
-        f"temperature={TEMPERATURE}, top_p={TOP_P}, context={CONTEXT_TOKENS}, appworld={APPWORLD_ROOT}",
+        f"temperature={TEMPERATURE}, top_p={TOP_P}, context={CONTEXT_TOKENS}, appworld={APPWORLD_ROOT}, "
+        f"sync_batches={SYNC_BATCHES}, no_think={NO_THINK}",
         flush=True,
     )
 
@@ -470,11 +523,19 @@ def main() -> None:
         queue = list(order)
         position = 0
         while done < BUDGET:
-            while len(pending) < IN_FLIGHT and queue:
-                pacer.wait(done)
+            room = IN_FLIGHT
+            if SYNC_BATCHES:
+                batch = done // BATCH
+                if not pending and done % BATCH == 0:
+                    wait_for_publication(batch)  # nothing in flight: the next batch starts on the new weights
+                room = BATCH - (done - batch * BATCH) - len(pending)  # episodes this batch still needs
+            while len(pending) < IN_FLIGHT and queue and room > 0:
+                if not SYNC_BATCHES:
+                    pacer.wait(done)
                 task_id = queue.pop(0)
                 if task_id in ungradable:
                     continue
+                room -= 1
                 future = pool.submit(one_episode, client, model, task_id, position)
                 problems_by_future[future] = task_id
                 pending.add(future)
